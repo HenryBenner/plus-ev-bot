@@ -1,0 +1,20 @@
+[Unit]
+Description=Prediction Hunt Fade Finder Trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/plus-ev-bot
+ExecStart=/home/YOUR_USER/plus-ev-bot/.venv/bin/python -m fadebot.main run
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+# Limit the worker without preventing normal SQLite and network operation.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

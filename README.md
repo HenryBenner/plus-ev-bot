@@ -58,26 +58,63 @@ In another terminal, print current results:
 
 The database is stored at `data/fade_finder.db`. Stop with Ctrl+C.
 
-## Run continuously on a VPS
+## Run in a Python environment on a Linux VPS
 
 ```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv
 git clone https://github.com/HenryBenner/plus-ev-bot.git
 cd plus-ev-bot
+python3 -m venv .venv
+./.venv/bin/python -m pip install --upgrade pip
+./.venv/bin/python -m pip install .
 cp .env.example .env
-# Edit .env and add PREDICTION_HUNT_API_KEY.
-docker compose up -d --build
-docker compose logs -f
+nano .env
 ```
 
-Print results without stopping the worker:
+Add `PREDICTION_HUNT_API_KEY` in `.env`, leave `TRADING_MODE=paper`, then
+start the worker:
 
 ```bash
-docker compose exec fade-bot fade-bot stats
+./.venv/bin/python -m fadebot.main run
 ```
 
-SQLite uses WAL mode and the container has no inbound port, keeping resource
-usage low enough to run alongside other small workers. The Compose volume
-preserves results across rebuilds.
+To keep it running after disconnecting from SSH, install the included systemd
+service. These commands assume the repository is at
+`/home/YOUR_USER/plus-ev-bot`:
+
+```bash
+sed "s|YOUR_USER|$USER|g" deploy/fade-bot.service.example > fade-bot.service
+sudo cp fade-bot.service /etc/systemd/system/fade-bot.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now fade-bot
+sudo systemctl status fade-bot
+```
+
+Follow the worker logs:
+
+```bash
+sudo journalctl -u fade-bot -f
+```
+
+Print results at any time:
+
+```bash
+cd ~/plus-ev-bot
+./.venv/bin/python -m fadebot.main stats
+```
+
+Update the VPS later with:
+
+```bash
+cd ~/plus-ev-bot
+git pull
+./.venv/bin/python -m pip install .
+sudo systemctl restart fade-bot
+```
+
+SQLite uses WAL mode and requires no database server. The worker has no
+inbound port, keeping it lightweight enough to run alongside other programs.
 
 ## Live mode
 
