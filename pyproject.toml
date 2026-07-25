@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prediction-hunt-fade-bot"
+version = "0.1.0"
+description = "Trade short-dated Fade Finder signals from Prediction Hunt."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "aiosqlite>=0.20,<1",
+  "httpx>=0.27,<1",
+  "websockets>=13,<16",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.24,<1",
+]
+live = [
+  "py-clob-client-v2>=1,<2",
+]
+
+[project.scripts]
+fade-bot = "fadebot.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
