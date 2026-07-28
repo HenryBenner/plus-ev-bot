@@ -156,7 +156,9 @@ def _to_market_info(market: dict[str, Any], event: dict[str, Any]) -> MarketInfo
     game_time = (
         parse_datetime(market.get("gameStartTime"))
         or parse_datetime(event.get("gameStartTime"))
-        or parse_datetime(market.get("endDate"))
+    )
+    expiration_time = (
+        parse_datetime(market.get("endDate"))
         or parse_datetime(event.get("endDate"))
     )
     category = str(event.get("category") or market.get("category") or "")
@@ -178,7 +180,7 @@ def _to_market_info(market: dict[str, Any], event: dict[str, Any]) -> MarketInfo
             or market.get("slug")
             or ""
         ),
-        event_time=game_time,
+        event_time=game_time or expiration_time,
         category=category,
         outcomes=outcomes,
         token_ids=token_ids,
@@ -187,6 +189,7 @@ def _to_market_info(market: dict[str, Any], event: dict[str, Any]) -> MarketInfo
         fees_enabled=bool(market.get("feesEnabled")),
         fee_rate=_fee_rate(category),
         neg_risk=bool(market.get("negRisk") or event.get("negRisk")),
+        expiration_time=expiration_time,
     )
 
 

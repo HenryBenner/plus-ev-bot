@@ -2,8 +2,8 @@
 
 A lightweight, unattended worker for Prediction Hunt's real-time Fade Finder
 WebSocket. It supports every market category, accepts only markets that
-start or expire within the next rolling 72 hours, and stores trades and
-settlements in SQLite. Paper mode is the safe default.
+expire within the next rolling 72 hours, and stores trades and settlements
+in SQLite. Paper mode is the safe default.
 
 There is no dashboard or web server.
 
@@ -12,8 +12,9 @@ There is no dashboard or web server.
 1. Connects to `wss://ws.predictionhunt.com` and subscribes to `fade_finder`.
 2. Stores and deduplicates every valid signal, including reconnect snapshots.
 3. Resolves the corresponding Polymarket market and its event/expiry time.
-4. Rejects markets that have started, are closed, lack a verifiable time, or
-   fall outside the next 72 hours.
+4. Allows events already in progress, but rejects markets that are closed,
+   expired, lack a verifiable expiration time, or expire outside the next
+   72 hours.
 5. Copies the signal's economic direction. `SELL YES` becomes `BUY NO`, and
    vice versa.
 6. Attempts up to $10 total cost, including modeled fees.
@@ -22,6 +23,11 @@ There is no dashboard or web server.
    left resting.
 8. Polls Polymarket for resolution, then records payout, P&L, ROI, win rate,
    fees, and other aggregate statistics.
+
+On startup, the worker also reconsiders signals stored by older versions with
+the rejection reason `event_already_started`. These are entered only at the
+current order book—not a fabricated historical price—and must still pass the
+72-hour expiration, open-market, liquidity, and 10-cent price checks.
 
 ## Run locally in paper mode
 

@@ -44,6 +44,13 @@ class TradingService:
             asyncio.create_task(self.signal_loop(), name="fade-signals"),
             asyncio.create_task(self.settlement_loop(), name="settlements"),
         ]
+        if self.settings.trading_mode == "paper":
+            self._tasks.append(
+                asyncio.create_task(
+                    self.reprocess_started_rejections(),
+                    name="started-signal-backfill",
+                )
+            )
 
     async def stop(self) -> None:
         for task in self._tasks:
@@ -61,8 +68,32 @@ class TradingService:
             except Exception:
                 logger.exception("Unexpected error processing Fade Finder message")
 
+    async def reprocess_started_rejections(self) -> None:
+        messages = await self.database.rejected_signal_messages(
+            "event_already_started"
+        )
+        if not messages:
+            return
+        logger.info(
+            "Reconsidering %d signals previously rejected because the event started",
+            len(messages),
+        )
+        for message in messages:
+            try:
+                await self.process_message(message, allow_existing=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Could not reconsider a previously rejected signal")
+            await asyncio.sleep(0.1)
+        logger.info("Finished reconsidering previously started-event signals")
+
     async def process_message(
-        self, message: dict[str, Any], now: datetime | None = None
+        self,
+        message: dict[str, Any],
+        now: datetime | None = None,
+        *,
+        allow_existing: bool = False,
     ) -> None:
         received_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         try:
@@ -71,7 +102,8 @@ class TradingService:
             logger.warning("Ignored malformed Fade Finder message: %s", exc)
             return
 
-        if not await self.database.add_signal(signal):
+        added = await self.database.add_signal(signal)
+        if not added and not allow_existing:
             logger.debug("Duplicate Fade Finder signal %s", signal.signal_id)
             return
 
@@ -246,17 +278,21 @@ def eligibility_reason(
     *,
     max_event_hours: int = 72,
 ) -> str | None:
-    event_time = market.event_time
-    if event_time is None and signal.resolution_date:
+    expiration_time = market.expiration_time
+    if expiration_time is None and signal.resolution_date:
         from .models import parse_datetime
 
-        event_time = parse_datetime(signal.resolution_date)
-    if event_time is None:
-        return "missing_event_time"
+        expiration_time = parse_datetime(signal.resolution_date)
+        if expiration_time and len(signal.resolution_date.strip()) == 10:
+            expiration_time += timedelta(days=1)
+    if expiration_time is None:
+        expiration_time = market.event_time
+    if expiration_time is None:
+        return "missing_expiration_time"
 
-    delta = event_time - now
+    delta = expiration_time - now
     if delta.total_seconds() < 0:
-        return "event_already_started"
+        return "market_already_expired"
     if delta > timedelta(hours=max_event_hours):
         return "event_outside_window"
     if market.closed:

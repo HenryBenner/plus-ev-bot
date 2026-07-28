@@ -155,6 +155,7 @@ class MarketInfo:
     fees_enabled: bool
     fee_rate: float = 0.05
     neg_risk: bool = False
+    expiration_time: datetime | None = None
 
     def token_for(self, outcome: str) -> str:
         wanted = outcome.casefold()

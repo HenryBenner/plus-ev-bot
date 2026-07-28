@@ -132,6 +132,26 @@ class Database:
             )
             await db.commit()
 
+    async def rejected_signal_messages(self, reason: str) -> list[dict[str, Any]]:
+        rows = await self._fetchall(
+            """
+            SELECT raw_json
+            FROM signals
+            WHERE status = 'rejected' AND rejection_reason = ?
+            ORDER BY received_at
+            """,
+            (reason,),
+        )
+        messages: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                message = json.loads(str(row["raw_json"]))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(message, dict):
+                messages.append(message)
+        return messages
+
     async def create_trade(
         self,
         signal: FadeSignal,
