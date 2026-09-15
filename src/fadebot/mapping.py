@@ -67,17 +67,25 @@ class InternationalToUSMapper:
         team = _team_from_winner_question(source.title)
         if not team:
             raise MappingError("team_name_not_found")
-        candidates = await self.us_client.search_markets(team)
-        matches: list[tuple[MarketInfo, str]] = []
-        for market in candidates:
-            if market.category.casefold() != "sports" or market.market_type != "team_winner":
-                continue
-            if not _same_game_time(source, market):
-                continue
-            if _same_team(team, market.long_label):
-                matches.append((market, "YES"))
-            elif _same_team(team, market.short_label):
-                matches.append((market, "NO"))
+        candidates = (
+            await self.us_client.sports_markets_near(source.event_time)
+            if source.event_time is not None
+            else await self.us_client.search_markets(team)
+        )
+        matches = _team_winner_matches(source, team, candidates)
+        if not matches and source.event_time is not None:
+            matches = _team_winner_matches(
+                source,
+                team,
+                await self.us_client.search_markets(team),
+            )
+        if len(matches) > 1:
+            closest = min(_game_time_delta(source, market) for market, _ in matches)
+            matches = [
+                item
+                for item in matches
+                if _game_time_delta(source, item[0]) == closest
+            ]
         if len(matches) != 1:
             raise MappingError(f"team_winner_candidates_{len(matches)}")
         market, source_yes_target_outcome = matches[0]
@@ -108,11 +116,72 @@ def _team_from_winner_question(title: str) -> str | None:
 def _same_team(left: str, right: str) -> bool:
     a = _normalize_team(left)
     b = _normalize_team(right)
-    return bool(a and b and (a == b or (len(a) >= 4 and a in b) or (len(b) >= 4 and b in a)))
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    a_tokens = a.split()
+    b_tokens = b.split()
+    if a in b or b in a:
+        shorter = a_tokens if len(a_tokens) < len(b_tokens) else b_tokens
+        generic = {
+            "angeles",
+            "city",
+            "club",
+            "de",
+            "del",
+            "los",
+            "madrid",
+            "new",
+            "real",
+            "sport",
+            "united",
+            "york",
+        }
+        if any(len(token) >= 5 and token not in generic for token in shorter):
+            return True
+    return len(a_tokens) == len(b_tokens) and all(
+        x == y or (min(len(x), len(y)) >= 4 and (x.startswith(y) or y.startswith(x)))
+        for x, y in zip(a_tokens, b_tokens)
+    )
+
+
+def _team_winner_matches(
+    source: MarketInfo,
+    team: str,
+    candidates: list[MarketInfo],
+) -> list[tuple[MarketInfo, str]]:
+    matches: list[tuple[MarketInfo, str]] = []
+    for market in candidates:
+        if market.category.casefold() != "sports" or market.market_type != "team_winner":
+            continue
+        if not _same_game_time(source, market):
+            continue
+        if _same_team(team, market.long_label):
+            matches.append((market, "YES"))
+        elif _same_team(team, market.short_label):
+            matches.append((market, "NO"))
+    return matches
 
 
 def _normalize_team(value: str) -> str:
-    ignored = {"fc", "cf", "sc", "the"}
+    ignored = {
+        "ac",
+        "afc",
+        "bv",
+        "ca",
+        "cf",
+        "club",
+        "fc",
+        "fbc",
+        "ff",
+        "fk",
+        "sc",
+        "se",
+        "sk",
+        "sv",
+        "the",
+    }
     return " ".join(word for word in _normalize(value).split() if word not in ignored)
 
 
@@ -120,6 +189,12 @@ def _same_game_time(source: MarketInfo, target: MarketInfo) -> bool:
     if source.event_time is None or target.event_time is None:
         return False
     return abs(source.event_time - target.event_time) <= timedelta(hours=24)
+
+
+def _game_time_delta(source: MarketInfo, target: MarketInfo) -> timedelta:
+    if source.event_time is None or target.event_time is None:
+        return timedelta.max
+    return abs(source.event_time - target.event_time)
 
 
 def _same_expiration(source: MarketInfo, target: MarketInfo) -> bool:

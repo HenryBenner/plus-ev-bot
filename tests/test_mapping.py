@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from fadebot.db import Database
-from fadebot.mapping import InternationalToUSMapper, MappingError
+from fadebot.mapping import InternationalToUSMapper, MappingError, _same_team
 from fadebot.models import MarketInfo
 
 
@@ -43,6 +43,10 @@ class FakeUSClient:
 
     async def search_markets(self, query: str) -> list[MarketInfo]:
         assert "Mets" in query
+        return self.results
+
+    async def sports_markets_near(self, event_time: datetime) -> list[MarketInfo]:
+        assert event_time == datetime(2026, 9, 20, 17, tzinfo=timezone.utc)
         return self.results
 
     async def market_by_slug(self, slug: str) -> MarketInfo:
@@ -99,3 +103,10 @@ async def test_ambiguous_team_mapping_is_rejected(tmp_path: Path):
         await InternationalToUSMapper(
             FakeUSClient(targets), database  # type: ignore[arg-type]
         ).map_market(source)
+
+
+def test_team_alias_normalization():
+    assert _same_team("Manchester City FC", "Manchester City")
+    assert _same_team("FC Internazionale Milano", "Inter Milan")
+    assert _same_team("BV Borussia 09 Dortmund", "Borussia 09 Dortmund")
+    assert not _same_team("Los Angeles Galaxy", "Los Angeles FC")

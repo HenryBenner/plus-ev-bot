@@ -173,6 +173,10 @@ The live mapper follows the strict configuration principle used by
 
 - sports team-winner markets match the team identity, scheduled game time, and
   US moneyline market type;
+- date-bounded US event lookup is used first so common team names do not depend
+  on search ranking;
+- full-game winners are kept separate from first-half, second-half, exact-score,
+  spread, and player-prop markets;
 - other types require an exact normalized title and matching expiry;
 - the mapper records which US LONG/SHORT side corresponds to the International
   YES side;

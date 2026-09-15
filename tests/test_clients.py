@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
-from fadebot.clients import PolymarketUSClient, _us_market
+from fadebot.clients import PolymarketUSClient, _market_type, _us_market
 from fadebot.config import Settings
 
 
@@ -82,6 +82,40 @@ async def test_short_book_is_complement_of_long_bids():
 
 
 @pytest.mark.asyncio
+async def test_date_bounded_sports_lookup_uses_event_time():
+    seen_query = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_query
+        assert request.url.path == "/v1/events"
+        seen_query = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={
+                "events": [
+                    {
+                        "slug": "us-test-event",
+                        "startTime": "2026-09-04T18:00:00Z",
+                        "category": "sports",
+                        "markets": [MARKET],
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = PolymarketUSClient(settings(), http)
+        markets = await client.sports_markets_near(
+            datetime(2026, 9, 4, 18, tzinfo=timezone.utc)
+        )
+    assert [market.market_slug for market in markets] == ["us-test-market"]
+    assert seen_query is not None
+    assert seen_query["active"] == "true"
+    assert seen_query["startTimeMin"] == "2026-09-04T16:00:00Z"
+    assert seen_query["startTimeMax"] == "2026-09-04T20:00:00Z"
+
+
+@pytest.mark.asyncio
 async def test_closed_market_uses_us_settlement_endpoint():
     closed = {**MARKET, "closed": True, "active": False}
 
@@ -129,3 +163,30 @@ def test_us_sports_market_uses_nested_team_identity():
     assert info.market_type == "team_winner"
     assert info.long_label == "New York Mets"
     assert info.short_label == "not New York Mets"
+
+
+def test_team_winner_excludes_partial_game_markets():
+    assert (
+        _market_type(
+            "soccer_team_full_time_winner",
+            "sports",
+            "Will Arsenal FC win against Chelsea FC?",
+        )
+        == "team_winner"
+    )
+    assert (
+        _market_type(
+            "soccer_team_second_half_winner",
+            "sports",
+            "Will Arsenal FC win the second half against Chelsea FC?",
+        )
+        == "soccer_team_second_half_winner"
+    )
+    assert (
+        _market_type(
+            "soccer_game_exact_score",
+            "sports",
+            "Will ARS vs CHE finish ARS wins 2-1?",
+        )
+        == "soccer_game_exact_score"
+    )

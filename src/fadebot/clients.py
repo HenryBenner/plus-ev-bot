@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+import unicodedata
 from collections.abc import AsyncIterator
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -134,9 +137,11 @@ class PolymarketUSClient:
         self.settings = settings
         self.http = http
         self._markets: dict[str, MarketInfo] = {}
+        self._request_lock = asyncio.Lock()
+        self._last_request_at = 0.0
 
     async def search_markets(self, query: str) -> list[MarketInfo]:
-        response = await self.http.get(
+        response = await self._get(
             f"{self.settings.polymarket_us_gateway_url}/v1/search",
             params={"query": query, "limit": 20, "status": "active"},
         )
@@ -148,15 +153,44 @@ class PolymarketUSClient:
             if not market.get("closed") and market.get("active", True)
         ]
 
+    async def sports_markets_near(self, event_time: datetime) -> list[MarketInfo]:
+        """Return active US markets starting near an International event time."""
+        event_time = event_time.astimezone(timezone.utc)
+        start = (event_time - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+        end = (event_time + timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+        markets: dict[str, MarketInfo] = {}
+        for offset in range(0, 300, 100):
+            response = await self._get(
+                f"{self.settings.polymarket_us_gateway_url}/v1/events",
+                params={
+                    "active": "true",
+                    "startTimeMin": start,
+                    "startTimeMax": end,
+                    "limit": 100,
+                    "offset": offset,
+                },
+            )
+            response.raise_for_status()
+            events = response.json().get("events") or []
+            for event in events:
+                for market in event.get("markets") or []:
+                    if market.get("closed") or not market.get("active", True):
+                        continue
+                    info = self._remember(_us_market(market, event))
+                    markets[info.market_slug] = info
+            if len(events) < 100:
+                break
+        return list(markets.values())
+
     async def market_by_slug(self, slug: str) -> MarketInfo:
-        response = await self.http.get(
+        response = await self._get(
             f"{self.settings.polymarket_us_gateway_url}/v1/market/slug/{slug}"
         )
         response.raise_for_status()
         market = response.json().get("market") or response.json()
         info = _us_market(market, {})
         if info.closed:
-            settlement = await self.http.get(
+            settlement = await self._get(
                 f"{self.settings.polymarket_us_gateway_url}"
                 f"/v1/markets/{info.market_slug}/settlement"
             )
@@ -170,7 +204,7 @@ class PolymarketUSClient:
 
     async def orderbook(self, market_side: str) -> dict[str, Any]:
         slug, outcome = split_us_market_side(market_side)
-        response = await self.http.get(
+        response = await self._get(
             f"{self.settings.polymarket_us_gateway_url}/v1/markets/{slug}/book"
         )
         response.raise_for_status()
@@ -195,6 +229,31 @@ class PolymarketUSClient:
     def _remember(self, market: MarketInfo) -> MarketInfo:
         self._markets[market.market_slug] = market
         return market
+
+    async def _get(self, url: str, **kwargs: Any) -> httpx.Response:
+        async with self._request_lock:
+            response: httpx.Response | None = None
+            for attempt in range(5):
+                spacing = 0.35 - (time.monotonic() - self._last_request_at)
+                if spacing > 0:
+                    await asyncio.sleep(spacing)
+                response = await self.http.get(url, **kwargs)
+                self._last_request_at = time.monotonic()
+                if response.status_code not in {429, 502, 503, 504}:
+                    return response
+                if attempt < 4:
+                    retry_after = response.headers.get("Retry-After")
+                    try:
+                        delay = (
+                            min(max(float(retry_after), 1.0), 8.0)
+                            if retry_after
+                            else min(1.0 * (2**attempt), 8.0)
+                        )
+                    except ValueError:
+                        delay = min(1.0 * (2**attempt), 8.0)
+                    await asyncio.sleep(delay)
+            assert response is not None
+            return response
 
 
 def _international_market(market: dict[str, Any], event: dict[str, Any]) -> MarketInfo:
@@ -324,11 +383,33 @@ def normalize_filter(value: str) -> str:
 
 def _market_type(value: str, category: str, title: str) -> str:
     normalized = normalize_filter(value)
-    if normalize_filter(category) == "sports" and (
-        normalized in {"moneyline", "sports_market_type_moneyline", "winner", "match_winner"}
-        or (title.casefold().startswith("will ") and " win" in title.casefold())
-    ):
-        return "team_winner"
+    normalized_title = normalize_filter(title)
+    if normalize_filter(category) == "sports":
+        partial_period = any(
+            marker in normalized
+            for marker in ("first_half", "second_half", "first_period", "second_period")
+        ) or any(
+            marker in normalized_title
+            for marker in ("at_halftime", "first_half", "second_half")
+        )
+        full_game_winner = (
+            normalized in {
+                "moneyline",
+                "sports_market_type_moneyline",
+                "winner",
+                "match_winner",
+                "drawable_outcome",
+            }
+            or "full_time_winner" in normalized
+            or normalized.endswith("_moneyline")
+        )
+        title_winner = (
+            normalized in {"", "unknown"}
+            and title.casefold().startswith("will ")
+            and " win" in title.casefold()
+        )
+        if not partial_period and (full_game_winner or title_winner):
+            return "team_winner"
     return normalized or "unknown"
 
 
@@ -358,6 +439,11 @@ def _side_price(sides: list[dict[str, Any]], long: bool) -> Any:
 
 
 def _normalize(value: str) -> str:
+    value = "".join(
+        char
+        for char in unicodedata.normalize("NFKD", value)
+        if not unicodedata.combining(char)
+    )
     return " ".join(
         "".join(char.casefold() if char.isalnum() else " " for char in value).split()
     )
