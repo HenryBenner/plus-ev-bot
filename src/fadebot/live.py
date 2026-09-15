@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
 from .config import Settings
@@ -18,7 +17,7 @@ class LiveExecution:
 
 
 class PolymarketLiveExecutor:
-    """Lazily loaded, explicitly gated Polymarket FAK order executor."""
+    """Explicitly gated Polymarket US immediate-or-cancel executor."""
 
     def __init__(self, settings: Settings):
         settings.validate_live_mode()
@@ -31,16 +30,13 @@ class PolymarketLiveExecutor:
         token_id: str,
         max_price: float,
         expected_fill: PaperFill,
+        requested_shares: int,
         tick_size: str,
         neg_risk: bool,
     ) -> LiveExecution:
+        del tick_size, neg_risk
         return await asyncio.to_thread(
-            self._buy_sync,
-            token_id,
-            max_price,
-            expected_fill,
-            tick_size,
-            neg_risk,
+            self._buy_sync, token_id, max_price, expected_fill, requested_shares
         )
 
     def _buy_sync(
@@ -48,155 +44,106 @@ class PolymarketLiveExecutor:
         token_id: str,
         max_price: float,
         expected_fill: PaperFill,
-        tick_size: str,
-        neg_risk: bool,
+        requested_shares: int,
     ) -> LiveExecution:
-        types = _sdk_types()
-        client = self._client or self._build_client(types)
+        market_slug, outcome = _split_market_side(token_id)
+        client = self._client or self._build_client()
         self._client = client
-        size = Decimal(str(expected_fill.shares)).quantize(
-            Decimal("0.01"), rounding=ROUND_DOWN
-        )
-        if size <= 0:
-            raise RuntimeError("Live order size rounded to zero")
-        order_args = types["OrderArgs"](
-            token_id=token_id,
-            price=float(max_price),
-            size=float(size),
-            side=types["Side"].BUY,
-        )
-        options = types["PartialCreateOrderOptions"](
-            tick_size=str(tick_size),
-            neg_risk=bool(neg_risk),
-        )
+        quantity = int(requested_shares)
+        if quantity <= 0:
+            raise RuntimeError("Live order quantity must be a positive integer")
+
+        payload = {
+            "marketSlug": market_slug,
+            "intent": (
+                "ORDER_INTENT_BUY_LONG"
+                if outcome == "YES"
+                else "ORDER_INTENT_BUY_SHORT"
+            ),
+            "type": "ORDER_TYPE_LIMIT",
+            "price": {"value": f"{max_price:.6f}", "currency": "USD"},
+            "quantity": quantity,
+            "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+            "participateDontInitiate": False,
+            "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+            "synchronousExecution": True,
+            "maxBlockTime": "10",
+        }
         try:
-            try:
-                response = client.create_and_post_order(
-                    order_args=order_args,
-                    options=options,
-                    order_type=types["OrderType"].FAK,
-                )
-            except TypeError:
-                response = client.create_and_post_order(
-                    order_args, options, types["OrderType"].FAK
-                )
+            raw = client.orders.create(payload)
         except Exception as exc:
             raise RuntimeError(
-                "Live order submission failed. The signal will not be retried "
+                "Polymarket US order submission failed. It will not be retried "
                 f"automatically to prevent a duplicate order: {exc}"
             ) from exc
+        if not isinstance(raw, dict):
+            raise RuntimeError("Polymarket US returned an invalid order response")
 
-        raw = _as_dict(response)
-        if raw.get("success") is False:
-            raise RuntimeError(
-                f"Polymarket rejected live FAK order: "
-                f"{raw.get('errorMsg') or raw}"
-            )
-        status = str(raw.get("status") or "").casefold()
-        if status not in {"matched", "filled", "delayed"}:
-            raise RuntimeError(
-                f"Live order state is not confirmed: status={status or 'missing'}"
-            )
-        order_id = str(
-            raw.get("orderID")
-            or raw.get("orderId")
-            or raw.get("order_id")
-            or ""
-        )
-        actual_fill = _fill_from_response(raw, expected_fill)
+        fill = _fill_from_executions(raw.get("executions") or [], expected_fill)
+        if fill is None:
+            raise RuntimeError("Polymarket US IOC order received no confirmed fill")
         return LiveExecution(
-            order_id=order_id,
-            status=status,
-            fill=actual_fill,
+            order_id=str(raw.get("id") or ""),
+            status="filled" if fill.fully_filled else "partially_filled",
+            fill=fill,
             raw=raw,
         )
 
-    def _build_client(self, types: dict[str, Any]) -> Any:
-        creds = types["ApiCreds"](
-            api_key=self.settings.polymarket_api_key,
-            api_secret=self.settings.polymarket_api_secret,
-            api_passphrase=self.settings.polymarket_api_passphrase,
-        )
-        signature_type: Any = self.settings.polymarket_signature_type
-        if signature_type == 3:
-            signature_type = types["SignatureTypeV2"].POLY_1271
-        return types["ClobClient"](
-            host=self.settings.polymarket_clob_url,
-            chain_id=137,
-            key=self.settings.polymarket_private_key,
-            creds=creds,
-            signature_type=signature_type,
-            funder=self.settings.polymarket_funder_address,
+    def _build_client(self) -> Any:
+        try:
+            from polymarket_us import PolymarketUS
+        except ImportError as exc:
+            raise RuntimeError(
+                "Install the Polymarket US SDK with: python -m pip install ."
+            ) from exc
+        return PolymarketUS(
+            key_id=self.settings.polymarket_us_key_id,
+            secret_key=self.settings.polymarket_us_secret_key,
+            gateway_base_url=self.settings.polymarket_us_gateway_url,
+            api_base_url=self.settings.polymarket_us_api_url,
+            timeout=float(self.settings.api_read_timeout_seconds),
         )
 
 
-def _sdk_types() -> dict[str, Any]:
-    try:
-        from py_clob_client_v2 import (
-            ApiCreds,
-            ClobClient,
-            OrderArgs,
-            OrderType,
-            PartialCreateOrderOptions,
-            Side,
-            SignatureTypeV2,
-        )
-    except ImportError as exc:
-        raise RuntimeError(
-            "Live mode requires the official SDK. Install with: "
-            'python -m pip install -e ".[live]"'
-        ) from exc
-    return {
-        "ApiCreds": ApiCreds,
-        "ClobClient": ClobClient,
-        "OrderArgs": OrderArgs,
-        "OrderType": OrderType,
-        "PartialCreateOrderOptions": PartialCreateOrderOptions,
-        "Side": Side,
-        "SignatureTypeV2": SignatureTypeV2,
-    }
+def _split_market_side(value: str) -> tuple[str, str]:
+    slug, separator, outcome = value.rpartition("::")
+    if not separator or outcome not in {"YES", "NO"}:
+        raise ValueError("Invalid Polymarket US market-side identifier")
+    return slug, outcome
 
 
-def _as_dict(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    if hasattr(value, "model_dump"):
-        return value.model_dump(by_alias=True)
-    if hasattr(value, "__dict__"):
-        return dict(vars(value))
-    raise RuntimeError(f"Polymarket returned an unsupported order response: {value}")
-
-
-def _fill_from_response(
-    raw: dict[str, Any], expected_fill: PaperFill
-) -> PaperFill:
-    making = _atomic_amount(
-        raw.get("makingAmount")
-        or raw.get("making_amount")
-        or raw.get("sizeMatched")
-        or raw.get("size_matched")
-    )
-    taking = _atomic_amount(
-        raw.get("takingAmount") or raw.get("taking_amount")
-    )
-    if making is None or taking is None or taking <= 0:
-        return expected_fill
-    notional = making
-    shares = taking
-    average_price = notional / shares
-    estimated_fee = max(expected_fill.total_cost - expected_fill.notional, 0)
+def _fill_from_executions(
+    executions: list[dict[str, Any]], expected: PaperFill
+) -> PaperFill | None:
+    shares = 0.0
+    notional = 0.0
+    fee = 0.0
+    for execution in executions:
+        if not execution.get("tradeId"):
+            continue
+        quantity = float(execution.get("lastShares") or 0)
+        price = _amount_value(execution.get("lastPx"))
+        if quantity <= 0 or price is None:
+            continue
+        shares += quantity
+        notional += quantity * price
+        fee += _amount_value(execution.get("commissionNotionalCollected")) or 0
+    if shares <= 0:
+        return None
+    total_cost = notional + fee
     return PaperFill(
         shares=shares,
         notional=notional,
-        fee=estimated_fee,
-        total_cost=notional + estimated_fee,
-        average_price=average_price,
-        fully_filled=expected_fill.fully_filled,
+        fee=fee,
+        total_cost=total_cost,
+        average_price=notional / shares,
+        fully_filled=shares >= expected.shares - 0.0001,
     )
 
 
-def _atomic_amount(value: Any) -> float | None:
+def _amount_value(value: Any) -> float | None:
+    if isinstance(value, dict):
+        value = value.get("value")
     if value in (None, ""):
         return None
-    amount = float(value)
-    return amount / 1_000_000 if amount > 10_000 else amount
+    return float(value)

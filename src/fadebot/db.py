@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS trades (
     max_price REAL,
     external_order_id TEXT,
     external_status TEXT,
+    platform TEXT NOT NULL DEFAULT 'international',
     status TEXT NOT NULL DEFAULT 'open',
     resolved_outcome TEXT,
     final_price REAL,
@@ -61,6 +62,15 @@ CREATE TABLE IF NOT EXISTS trades (
     pnl REAL,
     roi REAL,
     settled_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS market_mappings (
+    source_market_slug TEXT PRIMARY KEY,
+    target_market_slug TEXT NOT NULL,
+    source_yes_target_outcome TEXT NOT NULL,
+    mapping_method TEXT NOT NULL,
+    source_title TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at DESC);
@@ -88,6 +98,7 @@ class Database:
             "max_price": "REAL",
             "external_order_id": "TEXT",
             "external_status": "TEXT",
+            "platform": "TEXT NOT NULL DEFAULT 'international'",
         }
         for name, definition in additions.items():
             if name not in existing:
@@ -164,6 +175,8 @@ class Database:
         max_price: float | None = None,
         external_order_id: str | None = None,
         external_status: str | None = None,
+        platform: str = "international",
+        outcome: str | None = None,
     ) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute("BEGIN")
@@ -174,8 +187,9 @@ class Database:
                     market_id, condition_id, token_id, title, event_time,
                     outcome, signal_price, fill_avg_price, shares, notional,
                     entry_fee, cost_basis, fully_filled, filled_at,
-                    execution_mode, max_price, external_order_id, external_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    execution_mode, max_price, external_order_id, external_status,
+                    platform
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     signal.signal_id,
@@ -188,7 +202,7 @@ class Database:
                     token_id,
                     market.title or signal.title,
                     market.event_time.isoformat() if market.event_time else None,
-                    signal.paper_outcome,
+                    outcome or signal.paper_outcome,
                     signal.signal_price,
                     fill.average_price,
                     fill.shares,
@@ -201,6 +215,7 @@ class Database:
                     max_price,
                     external_order_id,
                     external_status,
+                    platform,
                 ),
             )
             await db.execute(
@@ -210,6 +225,48 @@ class Database:
                 WHERE signal_id = ?
                 """,
                 (signal.signal_id,),
+            )
+            await db.commit()
+
+    async def get_market_mapping(self, source_slug: str) -> dict[str, Any] | None:
+        rows = await self._fetchall(
+            "SELECT * FROM market_mappings WHERE source_market_slug = ?",
+            (source_slug,),
+        )
+        return rows[0] if rows else None
+
+    async def save_market_mapping(
+        self,
+        *,
+        source_slug: str,
+        target_slug: str,
+        source_yes_target_outcome: str,
+        method: str,
+        source_title: str,
+    ) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO market_mappings (
+                    source_market_slug, target_market_slug,
+                    source_yes_target_outcome, mapping_method,
+                    source_title, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_market_slug) DO UPDATE SET
+                    target_market_slug=excluded.target_market_slug,
+                    source_yes_target_outcome=excluded.source_yes_target_outcome,
+                    mapping_method=excluded.mapping_method,
+                    source_title=excluded.source_title,
+                    created_at=excluded.created_at
+                """,
+                (
+                    source_slug,
+                    target_slug,
+                    source_yes_target_outcome,
+                    method,
+                    source_title,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
             )
             await db.commit()
 

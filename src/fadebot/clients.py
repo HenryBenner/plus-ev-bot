@@ -31,27 +31,21 @@ class PredictionHuntClient:
                     ping_timeout=30,
                     max_size=2**20,
                 ) as ws:
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "action": "auth",
-                                "api_key": self.settings.prediction_hunt_api_key,
-                            }
-                        )
-                    )
-                    await ws.send(
-                        json.dumps(
-                            {"action": "subscribe", "channel": "fade_finder"}
-                        )
-                    )
+                    await ws.send(json.dumps({
+                        "action": "auth",
+                        "api_key": self.settings.prediction_hunt_api_key,
+                    }))
+                    await ws.send(json.dumps({
+                        "action": "subscribe", "channel": "fade_finder"
+                    }))
                     logger.info("Connected to Prediction Hunt Fade Finder")
                     delay = 1
                     async for raw_message in ws:
                         message = json.loads(raw_message)
                         if message.get("type") == "error":
                             raise RuntimeError(
-                                f"Prediction Hunt error "
-                                f"{message.get('code')}: {message.get('message')}"
+                                f"Prediction Hunt error {message.get('code')}: "
+                                f"{message.get('message')}"
                             )
                         if (
                             message.get("channel") == "fade_finder"
@@ -63,8 +57,7 @@ class PredictionHuntClient:
             except TimeoutError:
                 logger.warning(
                     "Prediction Hunt WebSocket handshake timed out; "
-                    "reconnecting in %ss",
-                    delay,
+                    "reconnecting in %ss", delay
                 )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60)
@@ -75,54 +68,47 @@ class PredictionHuntClient:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60)
 
-class PolymarketClient:
+
+class PolymarketInternationalClient:
+    """International market data used for signals and paper accounting."""
+
     def __init__(self, settings: Settings, http: httpx.AsyncClient):
         self.settings = settings
         self.http = http
 
     async def resolve_market(self, slug: str, title: str) -> MarketInfo:
-        market_response = await self.http.get(
+        response = await self.http.get(
             f"{self.settings.polymarket_gamma_url}/markets/slug/{slug}"
         )
-        if market_response.status_code == 200:
-            market = market_response.json()
-            event = _first(market.get("events")) or {}
-            return _to_market_info(market, event)
-        if market_response.status_code not in {404, 422}:
-            market_response.raise_for_status()
+        if response.status_code == 200:
+            market = response.json()
+            return _international_market(market, _first(market.get("events")) or {})
+        if response.status_code not in {404, 422}:
+            response.raise_for_status()
 
-        event_response = await self.http.get(
+        response = await self.http.get(
             f"{self.settings.polymarket_gamma_url}/events/slug/{slug}"
         )
-        event_response.raise_for_status()
-        event = event_response.json()
+        response.raise_for_status()
+        event = response.json()
         markets = event.get("markets") or []
-        if not markets:
-            raise ValueError("Polymarket event contains no markets")
-
         normalized_title = _normalize(title)
         exact = [m for m in markets if str(m.get("slug")) == slug]
         title_matches = [
-            m
-            for m in markets
-            if normalized_title
-            and normalized_title
-            in {
+            m for m in markets
+            if normalized_title in {
                 _normalize(str(m.get("question") or "")),
                 _normalize(str(m.get("groupItemTitle") or "")),
             }
         ]
         open_markets = [
-            m
-            for m in markets
+            m for m in markets
             if not m.get("closed") and m.get("enableOrderBook", True)
         ]
         candidates = exact or title_matches or open_markets
         if len(candidates) != 1:
-            raise ValueError(
-                f"market slug resolves to {len(candidates)} possible markets"
-            )
-        return _to_market_info(candidates[0], event)
+            raise ValueError(f"market slug resolves to {len(candidates)} markets")
+        return _international_market(candidates[0], event)
 
     async def orderbook(self, token_id: str) -> dict[str, Any]:
         response = await self.http.get(
@@ -138,59 +124,212 @@ class PolymarketClient:
         )
         response.raise_for_status()
         market = response.json()
-        event = _first(market.get("events")) or {}
-        return _to_market_info(market, event)
+        return _international_market(market, _first(market.get("events")) or {})
 
 
-def _to_market_info(market: dict[str, Any], event: dict[str, Any]) -> MarketInfo:
-    outcomes = [str(item) for item in _json_list(market.get("outcomes"))]
-    token_ids = [str(item) for item in _json_list(market.get("clobTokenIds"))]
-    outcome_prices = [
-        float(item) for item in _json_list(market.get("outcomePrices"))
-    ]
+class PolymarketUSClient:
+    """US market data plus strict search primitives used by the mapper."""
+
+    def __init__(self, settings: Settings, http: httpx.AsyncClient):
+        self.settings = settings
+        self.http = http
+        self._markets: dict[str, MarketInfo] = {}
+
+    async def search_markets(self, query: str) -> list[MarketInfo]:
+        response = await self.http.get(
+            f"{self.settings.polymarket_us_gateway_url}/v1/search",
+            params={"query": query, "limit": 20, "status": "active"},
+        )
+        response.raise_for_status()
+        return [
+            self._remember(_us_market(market, event))
+            for event in response.json().get("events") or []
+            for market in event.get("markets") or []
+            if not market.get("closed") and market.get("active", True)
+        ]
+
+    async def market_by_slug(self, slug: str) -> MarketInfo:
+        response = await self.http.get(
+            f"{self.settings.polymarket_us_gateway_url}/v1/market/slug/{slug}"
+        )
+        response.raise_for_status()
+        market = response.json().get("market") or response.json()
+        info = _us_market(market, {})
+        if info.closed:
+            settlement = await self.http.get(
+                f"{self.settings.polymarket_us_gateway_url}"
+                f"/v1/markets/{info.market_slug}/settlement"
+            )
+            if settlement.status_code == 200:
+                yes_price = float(settlement.json()["settlement"])
+                info = MarketInfo(**{
+                    **info.__dict__,
+                    "outcome_prices": [yes_price, 1.0 - yes_price],
+                })
+        return self._remember(info)
+
+    async def orderbook(self, market_side: str) -> dict[str, Any]:
+        slug, outcome = split_us_market_side(market_side)
+        response = await self.http.get(
+            f"{self.settings.polymarket_us_gateway_url}/v1/markets/{slug}/book"
+        )
+        response.raise_for_status()
+        data = response.json().get("marketData") or {}
+        if outcome == "YES":
+            asks = [
+                {"price": _amount(level.get("px")), "size": level.get("qty")}
+                for level in data.get("offers") or []
+            ]
+        else:
+            asks = [
+                {"price": 1.0 - _amount(level.get("px")), "size": level.get("qty")}
+                for level in data.get("bids") or []
+            ]
+        market = self._markets.get(slug)
+        return {
+            "asks": asks,
+            "tick_size": market.tick_size if market else 0.001,
+            "min_order_size": market.min_order_size if market else 1.0,
+        }
+
+    def _remember(self, market: MarketInfo) -> MarketInfo:
+        self._markets[market.market_slug] = market
+        return market
+
+
+def _international_market(market: dict[str, Any], event: dict[str, Any]) -> MarketInfo:
+    outcomes = [str(value) for value in _json_list(market.get("outcomes"))]
+    token_ids = [str(value) for value in _json_list(market.get("clobTokenIds"))]
+    prices = [float(value) for value in _json_list(market.get("outcomePrices"))]
     if len(outcomes) != len(token_ids):
-        raise ValueError("Polymarket outcome/token mapping is incomplete")
-    if len(outcome_prices) != len(outcomes):
-        outcome_prices = [0.0] * len(outcomes)
-
-    game_time = (
-        parse_datetime(market.get("gameStartTime"))
-        or parse_datetime(event.get("gameStartTime"))
-    )
-    expiration_time = (
-        parse_datetime(market.get("endDate"))
-        or parse_datetime(event.get("endDate"))
-    )
+        raise ValueError("International outcome/token mapping is incomplete")
+    if len(prices) != len(outcomes):
+        prices = [0.0] * len(outcomes)
     category = str(event.get("category") or market.get("category") or "")
-    if not category and (
-        market.get("gameStartTime")
-        or event.get("gameStartTime")
-        or market.get("sportsMarketType")
-    ):
+    market_type = str(
+        market.get("sportsMarketType")
+        or market.get("marketType")
+        or event.get("marketType")
+        or ""
+    )
+    game_time = parse_datetime(market.get("gameStartTime")) or parse_datetime(
+        event.get("gameStartTime")
+    )
+    if not category and (game_time is not None or market_type):
         category = "sports"
+    expiration = parse_datetime(market.get("endDate")) or parse_datetime(
+        event.get("endDate")
+    )
     return MarketInfo(
         market_id=str(market.get("id") or ""),
         condition_id=str(market.get("conditionId") or ""),
         market_slug=str(market.get("slug") or ""),
         event_slug=str(event.get("slug") or market.get("slug") or ""),
-        title=str(
-            market.get("question")
-            or market.get("groupItemTitle")
-            or event.get("title")
-            or market.get("slug")
-            or ""
-        ),
-        event_time=game_time or expiration_time,
+        title=str(market.get("question") or market.get("groupItemTitle") or ""),
+        event_time=game_time or expiration,
         category=category,
         outcomes=outcomes,
         token_ids=token_ids,
-        outcome_prices=outcome_prices,
+        outcome_prices=prices,
         closed=bool(market.get("closed")),
         fees_enabled=bool(market.get("feesEnabled")),
         fee_rate=_fee_rate(category),
         neg_risk=bool(market.get("negRisk") or event.get("negRisk")),
-        expiration_time=expiration_time,
+        expiration_time=expiration,
+        tick_size=float(market.get("orderPriceMinTickSize") or 0.01),
+        min_order_size=float(market.get("orderMinSize") or 0),
+        platform="international",
+        market_type=_market_type(market_type, category, str(market.get("question") or "")),
     )
+
+
+def _us_market(market: dict[str, Any], event: dict[str, Any]) -> MarketInfo:
+    slug = str(market.get("slug") or "")
+    sides = market.get("marketSides") or []
+    selected_team = next(
+        (
+            str((side.get("team") or {}).get("name") or "")
+            for side in sides
+            if side.get("long") is True and (side.get("team") or {}).get("name")
+        ),
+        "",
+    )
+    long_label = next(
+        (str(side.get("description") or "") for side in sides if side.get("long") is True),
+        "YES",
+    )
+    short_label = next(
+        (str(side.get("description") or "") for side in sides if side.get("long") is False),
+        "NO",
+    )
+    # US sports markets name the selected team in a nested object; the side
+    # descriptions themselves are normally just Yes and No.
+    if selected_team:
+        long_label = selected_team
+        short_label = f"not {selected_team}"
+    raw_prices = [float(value) for value in _json_list(market.get("outcomePrices"))]
+    if len(raw_prices) != 2:
+        long_price = _optional_float(
+            market.get("lastTradePrice") or market.get("bestAsk") or _side_price(sides, True)
+        )
+        raw_prices = [long_price, 1.0 - long_price] if long_price is not None else [0.0, 0.0]
+    category = str(event.get("category") or market.get("category") or "")
+    market_type = str(
+        market.get("sportsMarketType")
+        or market.get("sportsMarketTypeV2")
+        or market.get("marketType")
+        or ""
+    )
+    game_time = parse_datetime(market.get("gameStartTime")) or parse_datetime(
+        event.get("gameStartTime")
+    )
+    expiration = parse_datetime(market.get("endDate")) or parse_datetime(
+        event.get("endDate")
+    )
+    coefficient = float(market.get("feeCoefficient") or 0.05)
+    return MarketInfo(
+        market_id=str(market.get("id") or slug),
+        condition_id=str(market.get("id") or slug),
+        market_slug=slug,
+        event_slug=str(event.get("slug") or slug),
+        title=str(market.get("question") or event.get("title") or slug),
+        event_time=game_time or expiration,
+        category=category,
+        outcomes=["YES", "NO"],
+        token_ids=[f"{slug}::YES", f"{slug}::NO"],
+        outcome_prices=raw_prices,
+        closed=bool(market.get("closed")),
+        fees_enabled=coefficient > 0,
+        fee_rate=coefficient,
+        expiration_time=expiration,
+        tick_size=float(market.get("orderPriceMinTickSize") or 0.001),
+        min_order_size=float(market.get("minimumTradeQty") or 1),
+        platform="us",
+        market_type=_market_type(market_type, category, str(market.get("question") or "")),
+        long_label=long_label,
+        short_label=short_label,
+    )
+
+
+def split_us_market_side(value: str) -> tuple[str, str]:
+    slug, separator, outcome = value.rpartition("::")
+    if not separator or outcome not in {"YES", "NO"}:
+        raise ValueError("Invalid Polymarket US market-side identifier")
+    return slug, outcome
+
+
+def normalize_filter(value: str) -> str:
+    return value.strip().casefold().replace("-", "_").replace(" ", "_")
+
+
+def _market_type(value: str, category: str, title: str) -> str:
+    normalized = normalize_filter(value)
+    if normalize_filter(category) == "sports" and (
+        normalized in {"moneyline", "sports_market_type_moneyline", "winner", "match_winner"}
+        or (title.casefold().startswith("will ") and " win" in title.casefold())
+    ):
+        return "team_winner"
+    return normalized or "unknown"
 
 
 def _json_list(value: Any) -> list[Any]:
@@ -198,13 +337,24 @@ def _json_list(value: Any) -> list[Any]:
         return value
     if isinstance(value, str):
         parsed = json.loads(value)
-        if isinstance(parsed, list):
-            return parsed
+        return parsed if isinstance(parsed, list) else []
     return []
 
 
 def _first(value: Any) -> Any | None:
     return value[0] if isinstance(value, list) and value else None
+
+
+def _amount(value: Any) -> float:
+    return float(value.get("value") if isinstance(value, dict) else value)
+
+
+def _optional_float(value: Any) -> float | None:
+    return None if value in (None, "") else float(value)
+
+
+def _side_price(sides: list[dict[str, Any]], long: bool) -> Any:
+    return next((side.get("price") for side in sides if side.get("long") is long), None)
 
 
 def _normalize(value: str) -> str:
@@ -214,17 +364,10 @@ def _normalize(value: str) -> str:
 
 
 def _fee_rate(category: str) -> float:
-    normalized = category.strip().casefold()
-    rates = {
+    return {
         "crypto": 0.07,
         "sports": 0.03,
         "finance": 0.04,
         "politics": 0.04,
-        "economics": 0.05,
-        "culture": 0.05,
-        "weather": 0.05,
-        "tech": 0.04,
-        "mentions": 0.04,
         "geopolitics": 0.0,
-    }
-    return rates.get(normalized, 0.05)
+    }.get(category.strip().casefold(), 0.05)

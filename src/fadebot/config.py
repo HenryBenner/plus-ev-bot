@@ -31,16 +31,17 @@ class Settings:
     api_read_timeout_seconds: int = 45
     websocket_open_timeout_seconds: int = 60
     prediction_hunt_ws_url: str = "wss://ws.predictionhunt.com"
+    polymarket_us_gateway_url: str = "https://gateway.polymarket.us"
+    polymarket_us_api_url: str = "https://api.polymarket.us"
     polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
     polymarket_clob_url: str = "https://clob.polymarket.com"
     live_trading_enabled: bool = False
     live_trading_ack: str = ""
-    polymarket_private_key: str = ""
-    polymarket_api_key: str = ""
-    polymarket_api_secret: str = ""
-    polymarket_api_passphrase: str = ""
-    polymarket_funder_address: str = ""
-    polymarket_signature_type: int = 3
+    polymarket_us_key_id: str = ""
+    polymarket_us_secret_key: str = ""
+    live_shares_per_trade: int = 10
+    live_category_filters: tuple[str, ...] = ()
+    live_market_type_filters: tuple[str, ...] = ()
     log_level: str = "INFO"
 
     @classmethod
@@ -61,6 +62,9 @@ class Settings:
         drift = float(os.getenv("MAX_PRICE_DRIFT", "0.10"))
         if not 0 <= drift <= 1:
             raise ValueError("MAX_PRICE_DRIFT must be between zero and one")
+        live_shares = int(os.getenv("LIVE_SHARES_PER_TRADE", "10"))
+        if live_shares <= 0:
+            raise ValueError("LIVE_SHARES_PER_TRADE must be greater than zero")
         settings = cls(
             prediction_hunt_api_key=api_key,
             trading_mode=trading_mode,
@@ -78,6 +82,12 @@ class Settings:
             prediction_hunt_ws_url=os.getenv(
                 "PREDICTION_HUNT_WS_URL", "wss://ws.predictionhunt.com"
             ),
+            polymarket_us_gateway_url=os.getenv(
+                "POLYMARKET_US_GATEWAY_URL", "https://gateway.polymarket.us"
+            ).rstrip("/"),
+            polymarket_us_api_url=os.getenv(
+                "POLYMARKET_US_API_URL", "https://api.polymarket.us"
+            ).rstrip("/"),
             polymarket_gamma_url=os.getenv(
                 "POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com"
             ).rstrip("/"),
@@ -86,18 +96,13 @@ class Settings:
             ).rstrip("/"),
             live_trading_enabled=_bool_env("LIVE_TRADING_ENABLED", False),
             live_trading_ack=os.getenv("LIVE_TRADING_ACK", "").strip(),
-            polymarket_private_key=os.getenv("POLYMARKET_PRIVATE_KEY", "").strip(),
-            polymarket_api_key=os.getenv("POLYMARKET_API_KEY", "").strip(),
-            polymarket_api_secret=os.getenv("POLYMARKET_API_SECRET", "").strip(),
-            polymarket_api_passphrase=os.getenv(
-                "POLYMARKET_API_PASSPHRASE", ""
+            polymarket_us_key_id=os.getenv("POLYMARKET_KEY_ID", "").strip(),
+            polymarket_us_secret_key=os.getenv(
+                "POLYMARKET_SECRET_KEY", ""
             ).strip(),
-            polymarket_funder_address=os.getenv(
-                "POLYMARKET_FUNDER_ADDRESS", ""
-            ).strip(),
-            polymarket_signature_type=int(
-                os.getenv("POLYMARKET_SIGNATURE_TYPE", "3")
-            ),
+            live_shares_per_trade=live_shares,
+            live_category_filters=_csv_env("LIVE_CATEGORY_FILTERS"),
+            live_market_type_filters=_csv_env("LIVE_MARKET_TYPE_FILTERS"),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
         settings.validate_live_mode()
@@ -116,11 +121,8 @@ class Settings:
                 "I_UNDERSTAND_REAL_MONEY_IS_AT_RISK"
             )
         credentials = {
-            "POLYMARKET_PRIVATE_KEY": self.polymarket_private_key,
-            "POLYMARKET_API_KEY": self.polymarket_api_key,
-            "POLYMARKET_API_SECRET": self.polymarket_api_secret,
-            "POLYMARKET_API_PASSPHRASE": self.polymarket_api_passphrase,
-            "POLYMARKET_FUNDER_ADDRESS": self.polymarket_funder_address,
+            "POLYMARKET_KEY_ID": self.polymarket_us_key_id,
+            "POLYMARKET_SECRET_KEY": self.polymarket_us_secret_key,
         }
         missing = [name for name, value in credentials.items() if not value]
         if missing:
@@ -134,3 +136,11 @@ def _bool_env(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _csv_env(name: str) -> tuple[str, ...]:
+    return tuple(
+        value.strip().casefold().replace("-", "_").replace(" ", "_")
+        for value in os.getenv(name, "").split(",")
+        if value.strip()
+    )

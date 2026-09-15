@@ -8,12 +8,18 @@ from typing import Any
 
 import httpx
 
-from .clients import PolymarketClient, PredictionHuntClient
+from .clients import (
+    PolymarketInternationalClient,
+    PolymarketUSClient,
+    PredictionHuntClient,
+    normalize_filter,
+)
 from .config import Settings
 from .db import Database
 from .live import PolymarketLiveExecutor
+from .mapping import InternationalToUSMapper, MappingError
 from .models import FadeSignal, MarketInfo
-from .paper import simulate_market_buy
+from .paper import simulate_market_buy, simulate_share_buy
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +37,11 @@ class TradingService:
             headers={"User-Agent": "prediction-hunt-fade-paper-bot/0.1"},
         )
         self.prediction_hunt = PredictionHuntClient(settings)
-        self.polymarket = PolymarketClient(settings, self.http)
+        self.polymarket = PolymarketInternationalClient(settings, self.http)
+        self.polymarket_us = PolymarketUSClient(settings, self.http)
+        self.market_mapper = InternationalToUSMapper(
+            self.polymarket_us, database
+        )
         self.live_executor = (
             PolymarketLiveExecutor(settings)
             if settings.trading_mode == "live"
@@ -123,9 +133,34 @@ class TradingService:
             await self.database.reject_signal(signal.signal_id, eligibility_reason)
             return
 
+        target_market = market
+        target_outcome = signal.paper_outcome
+        market_client = self.polymarket
+        if self.settings.trading_mode == "live":
+            filter_reason = live_filter_reason(market, self.settings)
+            if filter_reason:
+                await self.database.reject_signal(signal.signal_id, filter_reason)
+                return
+            try:
+                mapping = await self.market_mapper.map_market(market)
+            except MappingError as exc:
+                await self.database.reject_signal(
+                    signal.signal_id, f"us_mapping_failed:{exc}"
+                )
+                return
+            except Exception as exc:
+                await self.database.reject_signal(
+                    signal.signal_id, f"us_mapping_error:{type(exc).__name__}"
+                )
+                logger.warning("US mapping failed for %s: %s", market.market_slug, exc)
+                return
+            target_market = mapping.market
+            target_outcome = mapping.target_outcome(signal.paper_outcome)
+            market_client = self.polymarket_us
+
         try:
-            token_id = market.token_for(signal.paper_outcome)
-            book = await self.polymarket.orderbook(token_id)
+            token_id = target_market.token_for(target_outcome)
+            book = await market_client.orderbook(token_id)
             asks = [
                 (float(level["price"]), float(level["size"]))
                 for level in book.get("asks") or []
@@ -144,19 +179,33 @@ class TradingService:
                     signal.signal_id, "price_guard_exceeded"
                 )
                 return
-            fill = simulate_market_buy(
-                asks,
-                self.settings.paper_stake_usd,
-                fees_enabled=market.fees_enabled,
-                fee_rate=market.fee_rate,
-                min_order_size=float(book.get("min_order_size") or 0),
-                max_price=max_price,
-            )
+            if self.settings.trading_mode == "live":
+                fill = simulate_share_buy(
+                    asks,
+                    self.settings.live_shares_per_trade,
+                    fees_enabled=target_market.fees_enabled,
+                    fee_rate=target_market.fee_rate,
+                    min_order_size=float(book.get("min_order_size") or 0),
+                    max_price=max_price,
+                )
+            else:
+                fill = simulate_market_buy(
+                    asks,
+                    self.settings.paper_stake_usd,
+                    fees_enabled=target_market.fees_enabled,
+                    fee_rate=target_market.fee_rate,
+                    min_order_size=float(book.get("min_order_size") or 0),
+                    max_price=max_price,
+                )
         except Exception as exc:
             await self.database.reject_signal(
                 signal.signal_id, f"orderbook_failed:{type(exc).__name__}"
             )
-            logger.warning("Could not simulate fill for %s: %s", market.market_slug, exc)
+            logger.warning(
+                "Could not simulate fill for %s: %s",
+                target_market.market_slug,
+                exc,
+            )
             return
 
         if fill is None:
@@ -172,8 +221,9 @@ class TradingService:
                     token_id=token_id,
                     max_price=max_price,
                     expected_fill=fill,
+                    requested_shares=self.settings.live_shares_per_trade,
                     tick_size=tick_size,
-                    neg_risk=market.neg_risk,
+                    neg_risk=target_market.neg_risk,
                 )
                 fill = execution.fill
                 external_order_id = execution.order_id
@@ -185,13 +235,13 @@ class TradingService:
                 )
                 logger.exception(
                     "Live order failed for %s; it was not retried",
-                    market.market_slug,
+                    target_market.market_slug,
                 )
                 return
 
         await self.database.create_trade(
             signal,
-            market,
+            target_market,
             token_id,
             fill,
             received_at,
@@ -199,12 +249,14 @@ class TradingService:
             max_price=max_price,
             external_order_id=external_order_id,
             external_status=external_status,
+            platform=target_market.platform,
+            outcome=target_outcome,
         )
         logger.info(
             "%s trade %s %s: %.4f shares @ %.4f, cost $%.2f (ceiling %.3f)",
             execution_mode.capitalize(),
-            signal.paper_outcome,
-            market.market_slug,
+            target_outcome,
+            target_market.market_slug,
             fill.shares,
             fill.average_price,
             fill.total_cost,
@@ -235,7 +287,12 @@ class TradingService:
         trades = await self.database.open_trades()
         for trade in trades:
             try:
-                market = await self.polymarket.market_by_slug(trade["market_slug"])
+                market_client = (
+                    self.polymarket_us
+                    if trade.get("platform") == "us"
+                    else self.polymarket
+                )
+                market = await market_client.market_by_slug(trade["market_slug"])
                 if not market.closed:
                     continue
                 final_price = market.final_price_for(trade["outcome"])
@@ -306,3 +363,20 @@ def _floor_to_tick(price: float, tick_size: str) -> float:
         raise ValueError("tick size must be positive")
     value = Decimal(str(price))
     return float((value / tick).to_integral_value(rounding=ROUND_DOWN) * tick)
+
+
+def live_filter_reason(market: MarketInfo, settings: Settings) -> str | None:
+    """Apply optional filters only to live execution, never paper collection."""
+    category = normalize_filter(market.category) or "unknown"
+    market_type = normalize_filter(market.market_type) or "unknown"
+    if (
+        settings.live_category_filters
+        and category not in settings.live_category_filters
+    ):
+        return f"live_filter_category:{category}"
+    if (
+        settings.live_market_type_filters
+        and market_type not in settings.live_market_type_filters
+    ):
+        return f"live_filter_market_type:{market_type}"
+    return None

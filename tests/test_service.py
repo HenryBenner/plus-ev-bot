@@ -5,7 +5,8 @@ import pytest
 
 from fadebot.db import Database
 from fadebot.models import FadeSignal, MarketInfo
-from fadebot.service import eligibility_reason
+from fadebot.config import Settings
+from fadebot.service import eligibility_reason, live_filter_reason
 
 from .test_models import sample_message
 
@@ -79,6 +80,22 @@ def test_non_sports_market_is_eligible():
     signal = FadeSignal.from_message(sample_message(), now)
     market = make_market(now + timedelta(hours=24), category="politics")
     assert eligibility_reason(signal, market, now) is None
+
+
+def test_live_filters_are_optional_and_mode_independent():
+    market = make_market(None, category="sports")
+    market = MarketInfo(**{**market.__dict__, "market_type": "team_winner"})
+    allow = Settings(
+        prediction_hunt_api_key="test",
+        live_category_filters=("sports",),
+        live_market_type_filters=("team_winner",),
+    )
+    assert live_filter_reason(market, allow) is None
+    reject = Settings(
+        prediction_hunt_api_key="test",
+        live_category_filters=("crypto",),
+    )
+    assert live_filter_reason(market, reject) == "live_filter_category:sports"
 
 
 def test_date_only_resolution_is_valid_through_end_of_day():

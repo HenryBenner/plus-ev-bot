@@ -1,6 +1,6 @@
 import pytest
 
-from fadebot.paper import simulate_market_buy, taker_fee
+from fadebot.paper import simulate_market_buy, simulate_share_buy, taker_fee
 
 
 def test_walks_book_and_includes_fee_in_budget():
@@ -68,3 +68,16 @@ def test_price_ceiling_can_reject_entire_book():
 
 def test_fee_formula():
     assert taker_fee(100, 0.5, 0.03) == pytest.approx(0.75)
+
+
+def test_fixed_share_buy_respects_quantity_and_price_ceiling():
+    fill = simulate_share_buy(
+        [(0.40, 5), (0.45, 20), (0.60, 100)],
+        10,
+        fees_enabled=False,
+        max_price=0.50,
+    )
+    assert fill is not None
+    assert fill.shares == pytest.approx(10)
+    assert fill.notional == pytest.approx(4.25)
+    assert fill.fully_filled

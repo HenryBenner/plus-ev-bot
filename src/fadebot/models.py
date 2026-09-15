@@ -156,6 +156,12 @@ class MarketInfo:
     fee_rate: float = 0.05
     neg_risk: bool = False
     expiration_time: datetime | None = None
+    tick_size: float = 0.001
+    min_order_size: float = 1.0
+    platform: str = "international"
+    market_type: str = ""
+    long_label: str = "YES"
+    short_label: str = "NO"
 
     def token_for(self, outcome: str) -> str:
         wanted = outcome.casefold()
