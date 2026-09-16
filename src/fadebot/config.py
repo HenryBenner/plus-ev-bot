@@ -40,8 +40,10 @@ class Settings:
     polymarket_us_key_id: str = ""
     polymarket_us_secret_key: str = ""
     live_shares_per_trade: int = 10
-    live_category_filters: tuple[str, ...] = ()
-    live_market_type_filters: tuple[str, ...] = ()
+    live_min_entry_price: float = 0.30
+    live_max_entry_price: float = 0.90
+    live_category_filters: tuple[str, ...] = ("sports",)
+    live_market_type_filters: tuple[str, ...] = ("team_winner",)
     log_level: str = "INFO"
 
     @classmethod
@@ -65,6 +67,13 @@ class Settings:
         live_shares = int(os.getenv("LIVE_SHARES_PER_TRADE", "10"))
         if live_shares <= 0:
             raise ValueError("LIVE_SHARES_PER_TRADE must be greater than zero")
+        live_min_price = float(os.getenv("LIVE_MIN_ENTRY_PRICE", "0.30"))
+        live_max_price = float(os.getenv("LIVE_MAX_ENTRY_PRICE", "0.90"))
+        if not 0 < live_min_price < live_max_price < 1:
+            raise ValueError(
+                "LIVE_MIN_ENTRY_PRICE and LIVE_MAX_ENTRY_PRICE must satisfy "
+                "0 < minimum < maximum < 1"
+            )
         settings = cls(
             prediction_hunt_api_key=api_key,
             trading_mode=trading_mode,
@@ -101,8 +110,10 @@ class Settings:
                 "POLYMARKET_SECRET_KEY", ""
             ).strip(),
             live_shares_per_trade=live_shares,
-            live_category_filters=_csv_env("LIVE_CATEGORY_FILTERS"),
-            live_market_type_filters=_csv_env("LIVE_MARKET_TYPE_FILTERS"),
+            live_min_entry_price=live_min_price,
+            live_max_entry_price=live_max_price,
+            live_category_filters=_csv_env("LIVE_CATEGORY_FILTERS", "sports"),
+            live_market_type_filters=_csv_env("LIVE_MARKET_TYPE_FILTERS", "team_winner"),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
         settings.validate_live_mode()
@@ -138,9 +149,9 @@ def _bool_env(name: str, default: bool) -> bool:
     return raw.strip().casefold() in {"1", "true", "yes", "on"}
 
 
-def _csv_env(name: str) -> tuple[str, ...]:
+def _csv_env(name: str, default: str = "") -> tuple[str, ...]:
     return tuple(
         value.strip().casefold().replace("-", "_").replace(" ", "_")
-        for value in os.getenv(name, "").split(",")
+        for value in os.getenv(name, default).split(",")
         if value.strip()
     )

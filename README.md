@@ -150,6 +150,8 @@ LIVE_TRADING_ACK=I_UNDERSTAND_REAL_MONEY_IS_AT_RISK
 POLYMARKET_KEY_ID=your-key-id
 POLYMARKET_SECRET_KEY=your-secret-key
 LIVE_SHARES_PER_TRADE=10
+LIVE_MIN_ENTRY_PRICE=0.30
+LIVE_MAX_ENTRY_PRICE=0.90
 # Empty means every category; comma-separated values are allowed.
 LIVE_CATEGORY_FILTERS=sports
 # team_winner means sports moneyline/winner markets.
@@ -160,6 +162,20 @@ Live entries use immediate-or-cancel limit orders with the same price ceiling, s
 available liquidity may fill partially and the remainder is cancelled. Failed
 submissions are not automatically retried, avoiding accidental duplicate
 real-money orders. Validate with a dedicated low-balance wallet before use.
+
+The live-only entry band checks the mapped US market's best executable price
+before submission; `0.30` to `0.90` means 30¢ through 90¢ inclusive. The upper
+limit is also built into the limit-order ceiling, alongside `MAX_PRICE_DRIFT`.
+The exchange could still execute at a better price below 30¢ if its book changes
+between the check and the order; a buy limit order cannot enforce a minimum
+execution price.
+
+The bot also claims a live YES or NO side for each US market in the existing
+SQLite database before submitting. Subsequent live alerts can add to that same
+side, but cannot submit the opposite side, even after a restart. The claim is
+kept after an uncertain submission failure, conservatively preventing a reversal.
+Earlier paper trades do not claim a live side. The lock applies per database;
+separate VPS databases cannot coordinate with one another.
 
 The live filters never limit paper collection. For example, with the settings
 above, paper mode still collects crypto, politics, props, totals, and other

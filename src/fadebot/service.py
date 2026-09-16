@@ -166,14 +166,18 @@ class TradingService:
                 for level in book.get("asks") or []
             ]
             tick_size = str(book.get("tick_size") or "0.01")
-            max_price = _floor_to_tick(
-                min(
-                    signal.paper_reference_price
-                    + self.settings.max_price_drift,
-                    0.99,
-                ),
+            max_price = live_price_ceiling(
+                signal.paper_reference_price,
+                self.settings,
                 tick_size,
             )
+            if self.settings.trading_mode == "live" and asks:
+                price_reason = live_entry_price_reason(
+                    min(price for price, _ in asks), self.settings
+                )
+                if price_reason:
+                    await self.database.reject_signal(signal.signal_id, price_reason)
+                    return
             if asks and min(price for price, _ in asks) > max_price:
                 await self.database.reject_signal(
                     signal.signal_id, "price_guard_exceeded"
@@ -216,11 +220,17 @@ class TradingService:
         external_order_id = None
         external_status = None
         if self.live_executor is not None:
+            if not await self.database.claim_live_market_side(
+                target_market.market_slug, target_outcome, signal.signal_id
+            ):
+                await self.database.reject_signal(
+                    signal.signal_id, "live_opposite_side_already_attempted"
+                )
+                return
             try:
                 execution = await self.live_executor.buy(
                     token_id=token_id,
                     max_price=max_price,
-                    expected_fill=fill,
                     requested_shares=self.settings.live_shares_per_trade,
                     tick_size=tick_size,
                     neg_risk=target_market.neg_risk,
@@ -363,6 +373,23 @@ def _floor_to_tick(price: float, tick_size: str) -> float:
         raise ValueError("tick size must be positive")
     value = Decimal(str(price))
     return float((value / tick).to_integral_value(rounding=ROUND_DOWN) * tick)
+
+
+def live_price_ceiling(
+    reference_price: float, settings: Settings, tick_size: str
+) -> float:
+    ceiling = min(reference_price + settings.max_price_drift, 0.99)
+    if settings.trading_mode == "live":
+        ceiling = min(ceiling, settings.live_max_entry_price)
+    return _floor_to_tick(ceiling, tick_size)
+
+
+def live_entry_price_reason(price: float, settings: Settings) -> str | None:
+    if price < settings.live_min_entry_price - 1e-9:
+        return "live_entry_price_below_minimum"
+    if price > settings.live_max_entry_price + 1e-9:
+        return "live_entry_price_above_maximum"
+    return None
 
 
 def live_filter_reason(market: MarketInfo, settings: Settings) -> str | None:

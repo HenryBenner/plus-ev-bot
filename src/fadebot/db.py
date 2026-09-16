@@ -73,6 +73,13 @@ CREATE TABLE IF NOT EXISTS market_mappings (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS live_market_sides (
+    market_slug TEXT PRIMARY KEY,
+    outcome TEXT NOT NULL CHECK (outcome IN ('YES', 'NO')),
+    first_signal_id TEXT NOT NULL,
+    claimed_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_filled ON trades(filled_at DESC);
@@ -269,6 +276,57 @@ class Database:
                 ),
             )
             await db.commit()
+
+    async def claim_live_market_side(
+        self, market_slug: str, outcome: str, signal_id: str
+    ) -> bool:
+        """Atomically prevent live orders opposing an earlier live attempt."""
+        selected = outcome.upper()
+        if selected not in {"YES", "NO"}:
+            raise ValueError("Live market side must be YES or NO")
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            prior = await (
+                await db.execute(
+                    "SELECT outcome FROM live_market_sides WHERE market_slug = ?",
+                    (market_slug,),
+                )
+            ).fetchone()
+            if prior is not None:
+                await db.commit()
+                return str(prior[0]) == selected
+
+            # Existing VPS databases may already contain live trades from older
+            # versions, before the side-lock table was introduced.
+            historic_opposite = await (
+                await db.execute(
+                    """
+                    SELECT 1 FROM trades
+                    WHERE market_slug = ? AND execution_mode = 'live'
+                      AND UPPER(outcome) <> ?
+                    LIMIT 1
+                    """,
+                    (market_slug, selected),
+                )
+            ).fetchone()
+            if historic_opposite is not None:
+                await db.commit()
+                return False
+            await db.execute(
+                """
+                INSERT INTO live_market_sides (
+                    market_slug, outcome, first_signal_id, claimed_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    market_slug,
+                    selected,
+                    signal_id,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            await db.commit()
+            return True
 
     async def open_trades(self) -> list[dict[str, Any]]:
         return await self._fetchall(

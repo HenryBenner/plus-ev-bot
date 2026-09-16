@@ -12,7 +12,6 @@ def test_market_side_identifier():
 
 
 def test_us_execution_response_becomes_fill():
-    expected = PaperFill(20, 9.8, 0.2, 10, 0.49, True)
     fill = _fill_from_executions(
         [
             {
@@ -28,7 +27,7 @@ def test_us_execution_response_becomes_fill():
                 "commissionNotionalCollected": {"value": "0.03"},
             },
         ],
-        expected,
+        20,
     )
     assert fill is not None
     assert fill.shares == pytest.approx(15)
@@ -67,10 +66,18 @@ def test_live_order_uses_configured_fixed_shares_and_ioc():
     )
     executor = PolymarketLiveExecutor(settings)
     executor._client = Client()
-    expected = PaperFill(10, 4.5, 0, 4.5, 0.45, True)
-    result = executor._buy_sync("us-market::NO", 0.50, expected, 10)
+    result = executor._buy_sync("us-market::NO", 0.50, 10)
     payload = Client.orders.payload
     assert payload["quantity"] == pytest.approx(10)
     assert payload["intent"] == "ORDER_INTENT_BUY_SHORT"
     assert payload["tif"] == "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
     assert result.fill.shares == pytest.approx(10)
+
+
+def test_partial_book_prediction_does_not_mislabel_execution_as_full():
+    fill = _fill_from_executions(
+        [{"tradeId": "one", "lastShares": "5", "lastPx": {"value": "0.5"}}],
+        10,
+    )
+    assert fill is not None
+    assert not fill.fully_filled

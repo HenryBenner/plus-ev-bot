@@ -29,21 +29,19 @@ class PolymarketLiveExecutor:
         *,
         token_id: str,
         max_price: float,
-        expected_fill: PaperFill,
         requested_shares: int,
         tick_size: str,
         neg_risk: bool,
     ) -> LiveExecution:
         del tick_size, neg_risk
         return await asyncio.to_thread(
-            self._buy_sync, token_id, max_price, expected_fill, requested_shares
+            self._buy_sync, token_id, max_price, requested_shares
         )
 
     def _buy_sync(
         self,
         token_id: str,
         max_price: float,
-        expected_fill: PaperFill,
         requested_shares: int,
     ) -> LiveExecution:
         market_slug, outcome = _split_market_side(token_id)
@@ -79,7 +77,7 @@ class PolymarketLiveExecutor:
         if not isinstance(raw, dict):
             raise RuntimeError("Polymarket US returned an invalid order response")
 
-        fill = _fill_from_executions(raw.get("executions") or [], expected_fill)
+        fill = _fill_from_executions(raw.get("executions") or [], requested_shares)
         if fill is None:
             raise RuntimeError("Polymarket US IOC order received no confirmed fill")
         return LiveExecution(
@@ -113,7 +111,7 @@ def _split_market_side(value: str) -> tuple[str, str]:
 
 
 def _fill_from_executions(
-    executions: list[dict[str, Any]], expected: PaperFill
+    executions: list[dict[str, Any]], requested_shares: int
 ) -> PaperFill | None:
     shares = 0.0
     notional = 0.0
@@ -137,7 +135,7 @@ def _fill_from_executions(
         fee=fee,
         total_cost=total_cost,
         average_price=notional / shares,
-        fully_filled=shares >= expected.shares - 0.0001,
+        fully_filled=shares >= requested_shares - 0.0001,
     )
 
 
