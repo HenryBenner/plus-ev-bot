@@ -21,6 +21,10 @@ def main() -> None:
         default="run",
         help="run the worker (default) or print stored performance statistics",
     )
+    parser.add_argument(
+        "--mode", choices=("paper", "live"),
+        help="filter stats to paper or live trades",
+    )
     args = parser.parse_args()
     try:
         settings = Settings.from_env()
@@ -33,8 +37,10 @@ def main() -> None:
     )
     database = Database(settings.database_path)
     if args.command == "stats":
-        asyncio.run(print_stats(database))
+        asyncio.run(print_stats(database, args.mode))
     else:
+        if args.mode:
+            parser.error("--mode is only valid with stats")
         try:
             asyncio.run(run_worker(settings, database))
         except KeyboardInterrupt:
@@ -55,12 +61,12 @@ async def run_worker(settings: Settings, database: Database) -> None:
         await service.stop()
 
 
-async def print_stats(database: Database) -> None:
+async def print_stats(database: Database, mode: str | None = None) -> None:
     await database.initialize()
-    summary = await database.summary()
-    recent = await database.recent_trades(10)
+    summary = await database.summary(mode)
+    recent = await database.recent_trades(10, mode)
     rows: list[tuple[str, Any, str]] = [
-        ("Signals received", summary.get("total_signals") or 0, "number"),
+        ("Signals received (all)", summary.get("total_signals") or 0, "number"),
         ("Trades", summary.get("total_trades") or 0, "number"),
         ("Open trades", summary.get("open_trades") or 0, "number"),
         ("Settled trades", summary.get("settled_trades") or 0, "number"),
@@ -75,7 +81,7 @@ async def print_stats(database: Database) -> None:
         ("Worst trade ROI", summary.get("worst_roi"), "percent"),
         ("Profit factor", summary.get("profit_factor"), "decimal"),
     ]
-    print("\nFADE FINDER TRADING STATS")
+    print(f"\nFADE FINDER TRADING STATS{f' ({mode.upper()})' if mode else ''}")
     print("=" * 43)
     for label, value, kind in rows:
         print(f"{label:<24} {_format_value(value, kind):>18}")

@@ -49,6 +49,13 @@ class SourceClient:
     async def resolve_market(self, slug: str, title: str) -> MarketInfo:
         return self.market
 
+    async def orderbook(self, market_side: str) -> dict:
+        return {
+            "asks": [{"price": 0.50, "size": 100}],
+            "tick_size": 0.01,
+            "min_order_size": 1,
+        }
+
 
 class USClient:
     def __init__(self, price: float):
@@ -111,10 +118,12 @@ async def test_live_service_rejects_reversal_after_first_us_order(tmp_path):
         await service.process_message(make_message("NO", "2026-07-23T18:01:00Z"), now)
         assert executor.orders == ["us-market::YES"]
         summary = await database.summary()
-        assert summary["total_trades"] == 1
+        assert summary["total_trades"] == 3
+        assert (await database.summary("paper"))["total_trades"] == 2
+        assert (await database.summary("live"))["total_trades"] == 1
         assert any(
             row["reason"] == "live_opposite_side_already_attempted"
-            for row in summary["rejections"]
+            for row in (await database.summary("live"))["rejections"]
         )
     finally:
         await service.stop()
@@ -144,6 +153,34 @@ async def test_live_service_rejects_price_outside_band(tmp_path, price):
     try:
         await service.process_message(make_message("YES", "2026-07-23T18:00:00Z"), now)
         assert executor.orders == []
-        assert (await database.summary())["total_trades"] == 0
+        assert (await database.summary("paper"))["total_trades"] == 1
+        assert (await database.summary("live"))["total_trades"] == 0
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_live_mode_paper_tracks_non_sports_without_live_order(tmp_path):
+    now = datetime(2026, 7, 23, 18, tzinfo=timezone.utc)
+    database = Database(tmp_path / "live.db")
+    await database.initialize()
+    settings = Settings(
+        prediction_hunt_api_key="test", trading_mode="live",
+        live_trading_enabled=True,
+        live_trading_ack="I_UNDERSTAND_REAL_MONEY_IS_AT_RISK",
+        polymarket_us_key_id="test", polymarket_us_secret_key="test",
+        database_path=database.path,
+    )
+    service = TradingService(settings, database)
+    market = make_market("intl-politics", now, "international")
+    service.polymarket = SourceClient(MarketInfo(**{**market.__dict__, "category": "politics"}))
+    executor = Executor(0.50)
+    service.live_executor = executor
+    try:
+        await service.process_message(make_message("YES", "2026-07-23T18:00:00Z"), now)
+        assert executor.orders == []
+        assert (await database.summary("paper"))["total_trades"] == 1
+        assert (await database.summary("live"))["total_trades"] == 0
+        assert (await database.summary("live"))["rejections"][0]["reason"] == "live_filter_category:politics"
     finally:
         await service.stop()

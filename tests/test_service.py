@@ -1,10 +1,11 @@
 import asyncio
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from fadebot.db import Database
+from fadebot.db import Database, SCHEMA
 from fadebot.models import FadeSignal, MarketInfo
 from fadebot.config import Settings
 from fadebot.service import (
@@ -253,3 +254,38 @@ async def test_live_side_lock_respects_older_live_trades_but_not_paper(tmp_path:
         outcome="YES",
     )
     assert await database.claim_live_market_side("paper-only", "NO", "new")
+
+
+@pytest.mark.asyncio
+async def test_existing_database_preserves_paper_trade_and_adds_live_for_same_signal(tmp_path: Path):
+    path = tmp_path / "legacy.db"
+    legacy_schema = SCHEMA.replace(
+        "signal_id TEXT NOT NULL REFERENCES signals(signal_id),",
+        "signal_id TEXT NOT NULL UNIQUE REFERENCES signals(signal_id),",
+    ).replace("    UNIQUE(signal_id, execution_mode)\n", "")
+    legacy_schema = legacy_schema.replace("    settled_at TEXT,\n);", "    settled_at TEXT\n);")
+    with sqlite3.connect(path) as connection:
+        connection.executescript(legacy_schema)
+    database = Database(path)
+    now = datetime(2026, 7, 23, 18, tzinfo=timezone.utc)
+    signal = FadeSignal.from_message(sample_message(), now)
+    assert await database.add_signal(signal)
+    from fadebot.models import PaperFill
+    fill = PaperFill(10, 5, 0, 5, 0.5, True)
+    market = make_market(now + timedelta(hours=2))
+    await database.create_trade(signal, market, "yes-token", fill, now)
+    old_id = (await database.recent_trades())[0]["id"]
+    await database.settle_trade(
+        old_id, final_price=1, resolved_outcome="Yes",
+        settled_at=now + timedelta(hours=3),
+    )
+    await database.initialize()
+    await database.create_trade(
+        signal, market, "yes-token", fill, now, execution_mode="live", platform="us"
+    )
+    trades = await database.recent_trades()
+    assert len(trades) == 2
+    assert {row["execution_mode"] for row in trades} == {"paper", "live"}
+    assert (await database.recent_trades(mode="paper"))[0]["id"] == old_id
+    assert (await database.recent_trades(mode="paper"))[0]["pnl"] == pytest.approx(5)
+    assert (await database.summary("live"))["total_trades"] == 1

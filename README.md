@@ -177,10 +177,18 @@ kept after an uncertain submission failure, conservatively preventing a reversal
 Earlier paper trades do not claim a live side. The lock applies per database;
 separate VPS databases cannot coordinate with one another.
 
-The live filters never limit paper collection. For example, with the settings
-above, paper mode still collects crypto, politics, props, totals, and other
-markets; live mode only submits mapped sports team-winner orders. Leave either
-filter blank to allow every value in that dimension.
+The live filters never limit paper collection. Even while `TRADING_MODE=live`,
+every eligible Fade Finder signal first gets a $10 paper trade against the
+International order book, subject to the ordinary paper price/liquidity guard.
+The bot then independently attempts a live order only for signals matching the
+live filters. For example, crypto, politics, props and totals continue to be
+paper-tracked while only mapped sports team-winner orders are sent live. Paper
+and live fills from one signal are separate records; existing database history
+is migrated in place. Leave either filter blank to allow every value in that
+dimension. Inspect separate performance with `python -m fadebot.main stats
+--mode paper` and `python -m fadebot.main stats --mode live`; omit `--mode` for
+combined stats. Live filter/order rejections are tracked separately from paper
+rejections.
 
 ## International to US mapping
 

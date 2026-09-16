@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS signals (
 
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    signal_id TEXT NOT NULL UNIQUE REFERENCES signals(signal_id),
+    signal_id TEXT NOT NULL REFERENCES signals(signal_id),
     event_id INTEGER,
     group_id INTEGER,
     event_slug TEXT NOT NULL,
@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS trades (
     payout REAL,
     pnl REAL,
     roi REAL,
-    settled_at TEXT
+    settled_at TEXT,
+    UNIQUE(signal_id, execution_mode)
 );
 
 CREATE TABLE IF NOT EXISTS market_mappings (
@@ -80,6 +81,13 @@ CREATE TABLE IF NOT EXISTS live_market_sides (
     claimed_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS live_attempts (
+    signal_id TEXT PRIMARY KEY REFERENCES signals(signal_id),
+    status TEXT NOT NULL,
+    reason TEXT,
+    recorded_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_filled ON trades(filled_at DESC);
@@ -95,7 +103,34 @@ class Database:
         async with aiosqlite.connect(self.path) as db:
             await db.executescript(SCHEMA)
             await self._ensure_trade_columns(db)
+            await self._ensure_dual_trade_constraint(db)
             await db.commit()
+
+    async def _ensure_dual_trade_constraint(self, db: aiosqlite.Connection) -> None:
+        row = await (await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='trades'"
+        )).fetchone()
+        if row is None or "UNIQUE(signal_id, execution_mode)" in str(row[0]):
+            return
+        # Rebuild only the trades table; preserve IDs, settlement data and all
+        # legacy columns while changing the old signal_id-only uniqueness rule.
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            ddl = SCHEMA.split("CREATE TABLE IF NOT EXISTS trades (", 1)[1].split(");", 1)[0]
+            await db.execute("CREATE TABLE trades_dual_migration (" + ddl + ")")
+            columns = [str(r[1]) for r in await (await db.execute("PRAGMA table_info(trades)")).fetchall()]
+            names = ", ".join(columns)
+            await db.execute(
+                f"INSERT INTO trades_dual_migration ({names}) SELECT {names} FROM trades"
+            )
+            await db.execute("DROP TABLE trades")
+            await db.execute("ALTER TABLE trades_dual_migration RENAME TO trades")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_filled ON trades(filled_at DESC)")
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
 
     async def _ensure_trade_columns(self, db: aiosqlite.Connection) -> None:
         rows = await (await db.execute("PRAGMA table_info(trades)")).fetchall()
@@ -147,6 +182,18 @@ class Database:
                 WHERE signal_id = ?
                 """,
                 (reason, signal_id),
+            )
+            await db.commit()
+
+    async def record_live_attempt(self, signal_id: str, status: str, reason: str | None = None) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """INSERT INTO live_attempts (signal_id, status, reason, recorded_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(signal_id) DO UPDATE SET
+                     status=excluded.status, reason=excluded.reason,
+                     recorded_at=excluded.recorded_at""",
+                (signal_id, status, reason, datetime.now(timezone.utc).isoformat()),
             )
             await db.commit()
 
@@ -372,7 +419,11 @@ class Database:
             )
             await db.commit()
 
-    async def summary(self) -> dict[str, Any]:
+    async def summary(self, mode: str | None = None) -> dict[str, Any]:
+        if mode not in (None, "paper", "live"):
+            raise ValueError("mode must be paper, live or None")
+        trade_where = "WHERE execution_mode = ?" if mode else ""
+        trade_params = (mode,) if mode else ()
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             signal_row = await (
@@ -405,16 +456,21 @@ class Database:
                         COALESCE(SUM(CASE WHEN status='settled' AND pnl > 0 THEN pnl ELSE 0 END), 0) AS gross_profit,
                         ABS(COALESCE(SUM(CASE WHEN status='settled' AND pnl < 0 THEN pnl ELSE 0 END), 0)) AS gross_loss
                     FROM trades
-                    """
+                    """ + trade_where,
+                    trade_params,
                 )
             ).fetchone()
             rejection_rows = await (
                 await db.execute(
-                    """
+                    ("""
                     SELECT rejection_reason AS reason, COUNT(*) AS count
                     FROM signals WHERE status = 'rejected'
                     GROUP BY rejection_reason ORDER BY count DESC
-                    """
+                    """ if mode != "live" else """
+                    SELECT reason, COUNT(*) AS count
+                    FROM live_attempts WHERE status = 'rejected'
+                    GROUP BY reason ORDER BY count DESC
+                    """),
                 )
             ).fetchall()
 
@@ -424,6 +480,8 @@ class Database:
         wins = int(result.get("wins") or 0)
         settled_cost = await self._scalar(
             "SELECT COALESCE(SUM(cost_basis), 0) FROM trades WHERE status='settled'"
+            + (" AND execution_mode = ?" if mode else ""),
+            trade_params,
         )
         pnl = float(result.get("pnl") or 0)
         gross_loss = float(result.get("gross_loss") or 0)
@@ -437,10 +495,15 @@ class Database:
         result["rejections"] = [dict(row) for row in rejection_rows]
         return result
 
-    async def recent_trades(self, limit: int = 100) -> list[dict[str, Any]]:
+    async def recent_trades(self, limit: int = 100, mode: str | None = None) -> list[dict[str, Any]]:
+        if mode not in (None, "paper", "live"):
+            raise ValueError("mode must be paper, live or None")
         safe_limit = min(max(int(limit), 1), 500)
         return await self._fetchall(
-            "SELECT * FROM trades ORDER BY filled_at DESC LIMIT ?", (safe_limit,)
+            "SELECT * FROM trades "
+            + ("WHERE execution_mode = ? " if mode else "")
+            + "ORDER BY filled_at DESC LIMIT ?",
+            (mode, safe_limit) if mode else (safe_limit,),
         )
 
     async def equity_curve(self) -> list[dict[str, Any]]:

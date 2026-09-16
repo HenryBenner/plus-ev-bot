@@ -133,144 +133,148 @@ class TradingService:
             await self.database.reject_signal(signal.signal_id, eligibility_reason)
             return
 
-        target_market = market
-        target_outcome = signal.paper_outcome
-        market_client = self.polymarket
+        await self._paper_trade(signal, market, received_at)
         if self.settings.trading_mode == "live":
-            filter_reason = live_filter_reason(market, self.settings)
-            if filter_reason:
-                await self.database.reject_signal(signal.signal_id, filter_reason)
-                return
-            try:
-                mapping = await self.market_mapper.map_market(market)
-            except MappingError as exc:
-                await self.database.reject_signal(
-                    signal.signal_id, f"us_mapping_failed:{exc}"
-                )
-                return
-            except Exception as exc:
-                await self.database.reject_signal(
-                    signal.signal_id, f"us_mapping_error:{type(exc).__name__}"
-                )
-                logger.warning("US mapping failed for %s: %s", market.market_slug, exc)
-                return
-            target_market = mapping.market
-            target_outcome = mapping.target_outcome(signal.paper_outcome)
-            market_client = self.polymarket_us
+            await self._live_trade(signal, market, received_at)
 
+    async def _paper_trade(
+        self, signal: FadeSignal, market: MarketInfo, received_at: datetime
+    ) -> None:
         try:
-            token_id = target_market.token_for(target_outcome)
-            book = await market_client.orderbook(token_id)
+            token_id = market.token_for(signal.paper_outcome)
+            book = await self.polymarket.orderbook(token_id)
             asks = [
                 (float(level["price"]), float(level["size"]))
                 for level in book.get("asks") or []
             ]
             tick_size = str(book.get("tick_size") or "0.01")
-            max_price = live_price_ceiling(
-                signal.paper_reference_price,
-                self.settings,
+            max_price = _floor_to_tick(
+                min(signal.paper_reference_price + self.settings.max_price_drift, 0.99),
                 tick_size,
             )
-            if self.settings.trading_mode == "live" and asks:
-                price_reason = live_entry_price_reason(
-                    min(price for price, _ in asks), self.settings
-                )
-                if price_reason:
-                    await self.database.reject_signal(signal.signal_id, price_reason)
-                    return
             if asks and min(price for price, _ in asks) > max_price:
-                await self.database.reject_signal(
-                    signal.signal_id, "price_guard_exceeded"
-                )
+                await self.database.reject_signal(signal.signal_id, "price_guard_exceeded")
                 return
-            if self.settings.trading_mode == "live":
-                fill = simulate_share_buy(
-                    asks,
-                    self.settings.live_shares_per_trade,
-                    fees_enabled=target_market.fees_enabled,
-                    fee_rate=target_market.fee_rate,
-                    min_order_size=float(book.get("min_order_size") or 0),
-                    max_price=max_price,
-                )
-            else:
-                fill = simulate_market_buy(
-                    asks,
-                    self.settings.paper_stake_usd,
-                    fees_enabled=target_market.fees_enabled,
-                    fee_rate=target_market.fee_rate,
-                    min_order_size=float(book.get("min_order_size") or 0),
-                    max_price=max_price,
-                )
+            fill = simulate_market_buy(
+                asks,
+                self.settings.paper_stake_usd,
+                fees_enabled=market.fees_enabled,
+                fee_rate=market.fee_rate,
+                min_order_size=float(book.get("min_order_size") or 0),
+                max_price=max_price,
+            )
         except Exception as exc:
             await self.database.reject_signal(
                 signal.signal_id, f"orderbook_failed:{type(exc).__name__}"
             )
-            logger.warning(
-                "Could not simulate fill for %s: %s",
-                target_market.market_slug,
-                exc,
-            )
+            logger.warning("Could not simulate paper fill for %s: %s", market.market_slug, exc)
             return
-
         if fill is None:
             await self.database.reject_signal(signal.signal_id, "unfilled_no_liquidity")
             return
-
-        execution_mode = self.settings.trading_mode
-        external_order_id = None
-        external_status = None
-        if self.live_executor is not None:
-            if not await self.database.claim_live_market_side(
-                target_market.market_slug, target_outcome, signal.signal_id
-            ):
-                await self.database.reject_signal(
-                    signal.signal_id, "live_opposite_side_already_attempted"
-                )
-                return
-            try:
-                execution = await self.live_executor.buy(
-                    token_id=token_id,
-                    max_price=max_price,
-                    requested_shares=self.settings.live_shares_per_trade,
-                    tick_size=tick_size,
-                    neg_risk=target_market.neg_risk,
-                )
-                fill = execution.fill
-                external_order_id = execution.order_id
-                external_status = execution.status
-            except Exception as exc:
-                await self.database.reject_signal(
-                    signal.signal_id,
-                    f"live_order_failed:{type(exc).__name__}",
-                )
-                logger.exception(
-                    "Live order failed for %s; it was not retried",
-                    target_market.market_slug,
-                )
-                return
-
         await self.database.create_trade(
             signal,
-            target_market,
+            market,
             token_id,
             fill,
             received_at,
-            execution_mode=execution_mode,
+            execution_mode="paper",
             max_price=max_price,
-            external_order_id=external_order_id,
-            external_status=external_status,
-            platform=target_market.platform,
-            outcome=target_outcome,
+            platform=market.platform,
+            outcome=signal.paper_outcome,
         )
         logger.info(
-            "%s trade %s %s: %.4f shares @ %.4f, cost $%.2f (ceiling %.3f)",
-            execution_mode.capitalize(),
-            target_outcome,
-            target_market.market_slug,
+            "Paper trade %s %s: %.4f shares @ %.4f, cost $%.2f (ceiling %.3f)",
+            signal.paper_outcome,
+            market.market_slug,
             fill.shares,
             fill.average_price,
             fill.total_cost,
             max_price,
+        )
+
+    async def _live_trade(
+        self, signal: FadeSignal, market: MarketInfo, received_at: datetime
+    ) -> None:
+        async def reject(reason: str) -> None:
+            await self.database.record_live_attempt(signal.signal_id, "rejected", reason)
+            logger.info("Live signal %s rejected: %s", signal.signal_id, reason)
+
+        filter_reason = live_filter_reason(market, self.settings)
+        if filter_reason:
+            await reject(filter_reason)
+            return
+        try:
+            mapping = await self.market_mapper.map_market(market)
+        except MappingError as exc:
+            await reject(f"us_mapping_failed:{exc}")
+            return
+        except Exception as exc:
+            await reject(f"us_mapping_error:{type(exc).__name__}")
+            logger.warning("US mapping failed for %s: %s", market.market_slug, exc)
+            return
+        target_market = mapping.market
+        target_outcome = mapping.target_outcome(signal.paper_outcome)
+        try:
+            token_id = target_market.token_for(target_outcome)
+            book = await self.polymarket_us.orderbook(token_id)
+            asks = [
+                (float(level["price"]), float(level["size"]))
+                for level in book.get("asks") or []
+            ]
+            tick_size = str(book.get("tick_size") or "0.01")
+            max_price = live_price_ceiling(signal.paper_reference_price, self.settings, tick_size)
+            if asks:
+                price_reason = live_entry_price_reason(min(price for price, _ in asks), self.settings)
+                if price_reason:
+                    await reject(price_reason)
+                    return
+            if asks and min(price for price, _ in asks) > max_price:
+                await reject("price_guard_exceeded")
+                return
+            fill = simulate_share_buy(
+                asks,
+                self.settings.live_shares_per_trade,
+                fees_enabled=target_market.fees_enabled,
+                fee_rate=target_market.fee_rate,
+                min_order_size=float(book.get("min_order_size") or 0),
+                max_price=max_price,
+            )
+        except Exception as exc:
+            await reject(f"orderbook_failed:{type(exc).__name__}")
+            logger.warning("Could not simulate live fill for %s: %s", target_market.market_slug, exc)
+            return
+        if fill is None:
+            await reject("unfilled_no_liquidity")
+            return
+        if not await self.database.claim_live_market_side(
+            target_market.market_slug, target_outcome, signal.signal_id
+        ):
+            await reject("live_opposite_side_already_attempted")
+            return
+        try:
+            execution = await self.live_executor.buy(
+                token_id=token_id,
+                max_price=max_price,
+                requested_shares=self.settings.live_shares_per_trade,
+                tick_size=tick_size,
+                neg_risk=target_market.neg_risk,
+            )
+        except Exception as exc:
+            await reject(f"live_order_failed:{type(exc).__name__}")
+            logger.exception("Live order failed for %s; it was not retried", target_market.market_slug)
+            return
+        await self.database.create_trade(
+            signal, target_market, token_id, execution.fill, received_at,
+            execution_mode="live", max_price=max_price,
+            external_order_id=execution.order_id, external_status=execution.status,
+            platform=target_market.platform, outcome=target_outcome,
+        )
+        await self.database.record_live_attempt(signal.signal_id, "traded")
+        logger.info(
+            "Live trade %s %s: %.4f shares @ %.4f, cost $%.2f (ceiling %.3f)",
+            target_outcome, target_market.market_slug, execution.fill.shares,
+            execution.fill.average_price, execution.fill.total_cost, max_price,
         )
 
     def eligibility_reason(
