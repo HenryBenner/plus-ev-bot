@@ -4,7 +4,7 @@ import pytest
 
 from fadebot.config import Settings
 from fadebot.db import Database
-from fadebot.live import LiveExecution
+from fadebot.live import LiveExecution, LiveOrderError
 from fadebot.mapping import USMarketMapping
 from fadebot.models import MarketInfo, PaperFill
 from fadebot.service import TradingService
@@ -78,19 +78,34 @@ class Mapper:
 
 
 class Executor:
-    def __init__(self, price: float):
+    def __init__(self, price: float, filled_shares: int | None = None):
         self.price = price
+        self.filled_shares = filled_shares
         self.orders: list[str] = []
 
     async def buy(self, *, token_id: str, **kwargs) -> LiveExecution:
         self.orders.append(token_id)
-        shares = kwargs["requested_shares"]
+        requested = kwargs["requested_shares"]
+        shares = self.filled_shares if self.filled_shares is not None else requested
         return LiveExecution(
             order_id=f"order-{len(self.orders)}",
-            status="filled",
-            fill=PaperFill(shares, shares * self.price, 0, shares * self.price, self.price, True),
+            status="filled" if shares == requested else "partially_filled",
+            fill=PaperFill(
+                shares, shares * self.price, 0, shares * self.price,
+                self.price, shares == requested,
+            ),
             raw={},
         )
+
+
+class FailingExecutor:
+    def __init__(self, classification: str):
+        self.classification = classification
+        self.calls = 0
+
+    async def buy(self, **kwargs):
+        self.calls += 1
+        raise LiveOrderError(self.classification, f"test {self.classification}")
 
 
 @pytest.mark.asyncio
@@ -182,5 +197,104 @@ async def test_live_mode_paper_tracks_non_sports_without_live_order(tmp_path):
         assert (await database.summary("paper"))["total_trades"] == 1
         assert (await database.summary("live"))["total_trades"] == 0
         assert (await database.summary("live"))["rejections"][0]["reason"] == "live_filter_category:politics"
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filled_shares", "expected_status"),
+    [(10, "filled"), (4, "partially_filled")],
+)
+async def test_live_fill_creates_trade_for_exact_executed_quantity(
+    tmp_path, filled_shares, expected_status, caplog
+):
+    now = datetime(2026, 7, 23, 18, tzinfo=timezone.utc)
+    database = Database(tmp_path / "live.db")
+    await database.initialize()
+    settings = Settings(
+        prediction_hunt_api_key="test", trading_mode="live",
+        live_trading_enabled=True,
+        live_trading_ack="I_UNDERSTAND_REAL_MONEY_IS_AT_RISK",
+        polymarket_us_key_id="test", polymarket_us_secret_key="test",
+        database_path=database.path,
+    )
+    service = TradingService(settings, database)
+    service.polymarket = SourceClient(make_market("intl", now, "international"))
+    service.polymarket_us = USClient(0.50)
+    service.market_mapper = Mapper(make_market("us-market", now, "us"))
+    service.live_executor = Executor(0.48, filled_shares)
+    try:
+        with caplog.at_level("INFO"):
+            await service.process_message(
+                make_message("YES", "2026-07-23T18:00:00Z"), now
+            )
+        live_trades = await database.recent_trades(mode="live")
+        assert len(live_trades) == 1
+        assert live_trades[0]["shares"] == pytest.approx(filled_shares)
+        assert live_trades[0]["external_status"] == expected_status
+        assert "LIVE ORDER ATTEMPT" in caplog.text
+        assert (
+            "LIVE ORDER FILLED" if expected_status == "filled"
+            else "LIVE ORDER PARTIALLY FILLED"
+        ) in caplog.text
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "classification",
+    ["canceled_no_fill", "ioc_no_fill", "rejected", "submission_error"],
+)
+async def test_classified_live_failure_creates_no_trade_and_is_not_retried(
+    tmp_path, classification
+):
+    now = datetime(2026, 7, 23, 18, tzinfo=timezone.utc)
+    database = Database(tmp_path / "live.db")
+    await database.initialize()
+    settings = Settings(
+        prediction_hunt_api_key="test", trading_mode="live",
+        live_trading_enabled=True,
+        live_trading_ack="I_UNDERSTAND_REAL_MONEY_IS_AT_RISK",
+        polymarket_us_key_id="test", polymarket_us_secret_key="test",
+        database_path=database.path,
+    )
+    service = TradingService(settings, database)
+    service.polymarket = SourceClient(make_market("intl", now, "international"))
+    service.polymarket_us = USClient(0.50)
+    service.market_mapper = Mapper(make_market("us-market", now, "us"))
+    executor = FailingExecutor(classification)
+    service.live_executor = executor
+    try:
+        await service.process_message(
+            make_message("YES", "2026-07-23T18:00:00Z"), now
+        )
+        assert await database.recent_trades(mode="live") == []
+        assert executor.calls == 1
+        reasons = (await database.summary("live"))["rejections"]
+        assert reasons == [{"reason": f"live_order_{classification}", "count": 1}]
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_missing_created_at_logs_sanitized_shape_and_does_not_crash(
+    tmp_path, caplog
+):
+    database = Database(tmp_path / "malformed.db")
+    await database.initialize()
+    settings = Settings(prediction_hunt_api_key="test", database_path=database.path)
+    service = TradingService(settings, database)
+    message = make_message("YES", "2026-07-23T18:00:00Z")
+    message["data"]["created_at"] = None
+    try:
+        with caplog.at_level("WARNING"):
+            await service.process_message(message)
+        assert (await database.summary())["total_signals"] == 0
+        assert "signal is missing a valid created_at" in caplog.text
+        assert "outer_data_keys" in caplog.text
+        assert "nested_data_keys" in caplog.text
+        assert "0xwinner" not in caplog.text
     finally:
         await service.stop()

@@ -16,7 +16,7 @@ from .clients import (
 )
 from .config import Settings
 from .db import Database
-from .live import PolymarketLiveExecutor
+from .live import LiveOrderError, PolymarketLiveExecutor
 from .mapping import InternationalToUSMapper, MappingError
 from .models import FadeSignal, MarketInfo
 from .paper import simulate_market_buy, simulate_share_buy
@@ -109,7 +109,14 @@ class TradingService:
         try:
             signal = FadeSignal.from_message(message, received_at=received_at)
         except (TypeError, ValueError) as exc:
-            logger.warning("Ignored malformed Fade Finder message: %s", exc)
+            if str(exc) == "signal is missing a valid created_at":
+                logger.warning(
+                    "Ignored malformed Fade Finder message: %s; summary=%s",
+                    exc,
+                    _malformed_message_summary(message),
+                )
+            else:
+                logger.warning("Ignored malformed Fade Finder message: %s", exc)
             return
 
         added = await self.database.add_signal(signal)
@@ -252,6 +259,23 @@ class TradingService:
         ):
             await reject("live_opposite_side_already_attempted")
             return
+        best_ask = min((price for price, _ in asks), default=None)
+        available_shares = sum(
+            size for price, size in asks if price <= max_price + 1e-9
+        )
+        logger.info(
+            "LIVE ORDER ATTEMPT signal_id=%s source_market=%s us_market=%s "
+            "outcome=%s quantity=%s best_ask=%s limit_price=%.6f "
+            "available_shares_at_or_below_limit=%.4f",
+            signal.signal_id,
+            market.market_slug,
+            target_market.market_slug,
+            target_outcome,
+            self.settings.live_shares_per_trade,
+            best_ask,
+            max_price,
+            available_shares,
+        )
         try:
             execution = await self.live_executor.buy(
                 token_id=token_id,
@@ -260,17 +284,48 @@ class TradingService:
                 tick_size=tick_size,
                 neg_risk=target_market.neg_risk,
             )
+        except LiveOrderError as exc:
+            await reject(f"live_order_{exc.classification}")
+            logger.error(
+                "Live order ended without a recorded trade for %s: "
+                "classification=%s detail=%s; it was not retried",
+                target_market.market_slug,
+                exc.classification,
+                exc,
+            )
+            return
         except Exception as exc:
             await reject(f"live_order_failed:{type(exc).__name__}")
             logger.exception("Live order failed for %s; it was not retried", target_market.market_slug)
             return
+        log_message = (
+            "LIVE ORDER FILLED"
+            if execution.status == "filled"
+            else "LIVE ORDER PARTIALLY FILLED"
+        )
+        logger.info(
+            "%s order_id=%s market=%s outcome=%s requested_shares=%s "
+            "filled_shares=%.4f avg_price=%.6f fees=%.6f total_cost=%.6f status=%s",
+            log_message,
+            execution.order_id,
+            target_market.market_slug,
+            target_outcome,
+            self.settings.live_shares_per_trade,
+            execution.fill.shares,
+            execution.fill.average_price,
+            execution.fill.fee,
+            execution.fill.total_cost,
+            execution.status,
+        )
         await self.database.create_trade(
             signal, target_market, token_id, execution.fill, received_at,
             execution_mode="live", max_price=max_price,
             external_order_id=execution.order_id, external_status=execution.status,
             platform=target_market.platform, outcome=target_outcome,
         )
-        await self.database.record_live_attempt(signal.signal_id, "traded")
+        await self.database.record_live_attempt(
+            signal.signal_id, "traded", execution.status
+        )
         logger.info(
             "Live trade %s %s: %.4f shares @ %.4f, cost $%.2f (ceiling %.3f)",
             target_outcome, target_market.market_slug, execution.fill.shares,
@@ -340,6 +395,28 @@ def _resolved_label(market: MarketInfo) -> str:
     if all(abs(price - 0.5) <= 0.01 for price in market.outcome_prices):
         return "void"
     return "split"
+
+
+def _malformed_message_summary(message: Any) -> dict[str, Any]:
+    """Extract message-shape metadata without wallet or credential values."""
+    if not isinstance(message, dict):
+        return {"message_type": type(message).__name__}
+    outer = message.get("data")
+    outer = outer if isinstance(outer, dict) else {}
+    nested = outer.get("data")
+    nested = nested if isinstance(nested, dict) else {}
+    return {
+        "channel": message.get("channel"),
+        "type": message.get("type"),
+        "websocket_ts": message.get("ts"),
+        "created_at": outer.get("created_at"),
+        "market_slug": outer.get("market_slug") or nested.get("marketSlug"),
+        "title": outer.get("title"),
+        "event_id": outer.get("event_id"),
+        "group_id": outer.get("group_id"),
+        "outer_data_keys": sorted(str(key) for key in outer),
+        "nested_data_keys": sorted(str(key) for key in nested),
+    }
 
 
 def eligibility_reason(
