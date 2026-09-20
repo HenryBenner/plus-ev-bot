@@ -149,7 +149,13 @@ def test_us_sports_market_uses_nested_team_identity():
                 {
                     "long": True,
                     "description": "Yes",
-                    "team": {"name": "New York Mets"},
+                    "team": {
+                        "name": "New York Mets",
+                        "alias": "NY Mets",
+                        "safeName": "new-york-mets",
+                        "abbreviation": "NYM",
+                        "league": "MLB",
+                    },
                 },
                 {
                     "long": False,
@@ -163,6 +169,43 @@ def test_us_sports_market_uses_nested_team_identity():
     assert info.market_type == "team_winner"
     assert info.long_label == "New York Mets"
     assert info.short_label == "not New York Mets"
+    assert info.long_aliases == ("New York Mets", "NY Mets", "new-york-mets", "NYM")
+    assert info.short_aliases == ()
+    assert info.league == "MLB"
+
+
+@pytest.mark.asyncio
+async def test_wide_sports_lookup_fully_paginates_24_hour_window():
+    seen_offsets = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/events"
+        offset = int(request.url.params["offset"])
+        seen_offsets.append(offset)
+        count = 100 if offset == 0 else 1
+        events = []
+        for index in range(count):
+            item = {
+                **MARKET,
+                "id": f"{offset}-{index}",
+                "slug": f"market-{offset}-{index}",
+                "category": "sports",
+            }
+            events.append({
+                "slug": f"event-{offset}-{index}",
+                "category": "sports",
+                "markets": [item],
+            })
+        return httpx.Response(200, json={"events": events})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = PolymarketUSClient(settings(), http)
+        markets = await client.sports_markets_wide(
+            datetime(2026, 9, 4, 18, tzinfo=timezone.utc)
+        )
+
+    assert seen_offsets == [0, 100]
+    assert len(markets) == 101
 
 
 def test_team_winner_excludes_partial_game_markets():

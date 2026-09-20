@@ -5,7 +5,7 @@ import pytest
 from fadebot.config import Settings
 from fadebot.db import Database
 from fadebot.live import LiveExecution, LiveOrderError
-from fadebot.mapping import USMarketMapping
+from fadebot.mapping import InternationalToUSMapper, USMarketMapping
 from fadebot.models import MarketInfo, PaperFill
 from fadebot.service import TradingService
 
@@ -67,6 +67,25 @@ class USClient:
             "tick_size": 0.01,
             "min_order_size": 1,
         }
+
+
+class MappingUSClient(USClient):
+    def __init__(self, price: float, target: MarketInfo):
+        super().__init__(price)
+        self.target = target
+
+    async def sports_markets_near(self, event_time: datetime) -> list[MarketInfo]:
+        return []
+
+    async def search_markets(self, query: str) -> list[MarketInfo]:
+        return []
+
+    async def sports_markets_wide(self, event_time: datetime) -> list[MarketInfo]:
+        return [self.target]
+
+    async def market_by_slug(self, slug: str) -> MarketInfo:
+        assert slug == self.target.market_slug
+        return self.target
 
 
 class Mapper:
@@ -296,5 +315,65 @@ async def test_missing_created_at_logs_sanitized_shape_and_does_not_crash(
         assert "outer_data_keys" in caplog.text
         assert "nested_data_keys" in caplog.text
         assert "0xwinner" not in caplog.text
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_team", "target_team", "aliases"),
+    [
+        ("SV Darmstadt 98", "Darmstadt 98", ()),
+        ("Psim Yogyakarta", "Perserikatan Sepakbola Indonesia Mataram", ("PSIM Yogyakarta",)),
+        ("Olympique de Marseille", "Marseille", ("OM",)),
+        ("TSG 1899 Hoffenheim", "Hoffenheim", ("TSG Hoffenheim",)),
+    ],
+)
+async def test_historical_mapping_misses_reach_live_execution(
+    tmp_path, source_team, target_team, aliases
+):
+    now = datetime(2026, 9, 20, 17, tzinfo=timezone.utc)
+    database = Database(tmp_path / "live.db")
+    await database.initialize()
+    settings = Settings(
+        prediction_hunt_api_key="test", trading_mode="live",
+        live_trading_enabled=True,
+        live_trading_ack="I_UNDERSTAND_REAL_MONEY_IS_AT_RISK",
+        polymarket_us_key_id="test", polymarket_us_secret_key="test",
+        database_path=database.path,
+    )
+    source = make_market("intl-team", now, "international")
+    source = MarketInfo(**{
+        **source.__dict__,
+        "title": f"Will {source_team} win?",
+        "event_slug": f"{source_team}-vs-opponent",
+    })
+    target = make_market("us-team", now, "us")
+    target = MarketInfo(**{
+        **target.__dict__,
+        "title": f"{target_team} vs Opponent",
+        "event_slug": f"{target_team}-vs-opponent",
+        "event_time": now + timedelta(hours=4),
+        "long_label": target_team,
+        "short_label": "Opponent",
+        "long_aliases": aliases,
+    })
+    service = TradingService(settings, database)
+    service.polymarket = SourceClient(source)
+    us_client = MappingUSClient(0.50, target)
+    service.polymarket_us = us_client
+    service.market_mapper = InternationalToUSMapper(
+        us_client, database  # type: ignore[arg-type]
+    )
+    executor = Executor(0.50)
+    service.live_executor = executor
+    try:
+        await service.process_message(
+            make_message("YES", "2026-09-20T17:00:00Z"), now
+        )
+        assert executor.orders == ["us-team::YES"]
+        trades = await database.recent_trades(mode="live")
+        assert len(trades) == 1
+        assert trades[0]["market_slug"] == "us-team"
     finally:
         await service.stop()

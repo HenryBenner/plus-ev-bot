@@ -155,11 +155,21 @@ class PolymarketUSClient:
 
     async def sports_markets_near(self, event_time: datetime) -> list[MarketInfo]:
         """Return active US markets starting near an International event time."""
+        return await self._sports_markets_window(event_time, hours=2)
+
+    async def sports_markets_wide(self, event_time: datetime) -> list[MarketInfo]:
+        """Fully paginate active US sports events within 24 hours of a game."""
+        return await self._sports_markets_window(event_time, hours=24)
+
+    async def _sports_markets_window(
+        self, event_time: datetime, *, hours: int
+    ) -> list[MarketInfo]:
         event_time = event_time.astimezone(timezone.utc)
-        start = (event_time - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
-        end = (event_time + timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+        start = (event_time - timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
+        end = (event_time + timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
         markets: dict[str, MarketInfo] = {}
-        for offset in range(0, 300, 100):
+        offset = 0
+        while True:
             response = await self._get(
                 f"{self.settings.polymarket_us_gateway_url}/v1/events",
                 params={
@@ -180,6 +190,7 @@ class PolymarketUSClient:
                     markets[info.market_slug] = info
             if len(events) < 100:
                 break
+            offset += 100
         return list(markets.values())
 
     async def market_by_slug(self, slug: str) -> MarketInfo:
@@ -299,20 +310,29 @@ def _international_market(market: dict[str, Any], event: dict[str, Any]) -> Mark
         min_order_size=float(market.get("orderMinSize") or 0),
         platform="international",
         market_type=_market_type(market_type, category, str(market.get("question") or "")),
+        league=str(
+            event.get("league")
+            or event.get("leagueSlug")
+            or market.get("league")
+            or ""
+        ),
     )
 
 
 def _us_market(market: dict[str, Any], event: dict[str, Any]) -> MarketInfo:
     slug = str(market.get("slug") or "")
     sides = market.get("marketSides") or []
-    selected_team = next(
-        (
-            str((side.get("team") or {}).get("name") or "")
-            for side in sides
-            if side.get("long") is True and (side.get("team") or {}).get("name")
-        ),
-        "",
-    )
+    long_side = next((side for side in sides if side.get("long") is True), {})
+    short_side = next((side for side in sides if side.get("long") is False), {})
+    long_aliases = _team_aliases(long_side)
+    short_aliases = _team_aliases(short_side)
+    selected_team = long_aliases[0] if long_aliases else ""
+    if (
+        selected_team
+        and short_aliases
+        and short_aliases[0].casefold() == selected_team.casefold()
+    ):
+        short_aliases = ()
     long_label = next(
         (str(side.get("description") or "") for side in sides if side.get("long") is True),
         "YES",
@@ -325,7 +345,7 @@ def _us_market(market: dict[str, Any], event: dict[str, Any]) -> MarketInfo:
     # descriptions themselves are normally just Yes and No.
     if selected_team:
         long_label = selected_team
-        short_label = f"not {selected_team}"
+        short_label = short_aliases[0] if short_aliases else f"not {selected_team}"
     raw_prices = [float(value) for value in _json_list(market.get("outcomePrices"))]
     if len(raw_prices) != 2:
         long_price = _optional_float(
@@ -346,6 +366,14 @@ def _us_market(market: dict[str, Any], event: dict[str, Any]) -> MarketInfo:
         event.get("endDate")
     )
     coefficient = float(market.get("feeCoefficient") or 0.05)
+    team_league = next(
+        (
+            str((side.get("team") or {}).get("league") or "")
+            for side in sides
+            if (side.get("team") or {}).get("league")
+        ),
+        "",
+    )
     return MarketInfo(
         market_id=str(market.get("id") or slug),
         condition_id=str(market.get("id") or slug),
@@ -367,7 +395,35 @@ def _us_market(market: dict[str, Any], event: dict[str, Any]) -> MarketInfo:
         market_type=_market_type(market_type, category, str(market.get("question") or "")),
         long_label=long_label,
         short_label=short_label,
+        long_aliases=long_aliases,
+        short_aliases=short_aliases,
+        league=str(
+            event.get("league")
+            or event.get("leagueSlug")
+            or market.get("league")
+            or team_league
+            or ""
+        ),
     )
+
+
+def _team_aliases(side: Any) -> tuple[str, ...]:
+    if not isinstance(side, dict):
+        return ()
+    team = side.get("team")
+    team = team if isinstance(team, dict) else {}
+    values = [
+        team.get("name"),
+        team.get("alias"),
+        team.get("safeName"),
+        team.get("abbreviation"),
+    ]
+    aliases: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text.casefold() not in {item.casefold() for item in aliases}:
+            aliases.append(text)
+    return tuple(aliases)
 
 
 def split_us_market_side(value: str) -> tuple[str, str]:

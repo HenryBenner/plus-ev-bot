@@ -162,6 +162,9 @@ class MarketInfo:
     market_type: str = ""
     long_label: str = "YES"
     short_label: str = "NO"
+    long_aliases: tuple[str, ...] = ()
+    short_aliases: tuple[str, ...] = ()
+    league: str = ""
 
     def token_for(self, outcome: str) -> str:
         wanted = outcome.casefold()
