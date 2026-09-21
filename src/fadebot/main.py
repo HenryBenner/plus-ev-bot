@@ -17,9 +17,12 @@ def main() -> None:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("run", "stats"),
+        choices=("run", "stats", "reconcile-live-settlements"),
         default="run",
-        help="run the worker (default) or print stored performance statistics",
+        help=(
+            "run the worker (default), print statistics, or repair US live "
+            "settlements from the official endpoint"
+        ),
     )
     parser.add_argument(
         "--mode", choices=("paper", "live"),
@@ -38,6 +41,10 @@ def main() -> None:
     database = Database(settings.database_path)
     if args.command == "stats":
         asyncio.run(print_stats(database, args.mode))
+    elif args.command == "reconcile-live-settlements":
+        if args.mode:
+            parser.error("--mode is only valid with stats")
+        asyncio.run(reconcile_live_settlements(settings, database))
     else:
         if args.mode:
             parser.error("--mode is only valid with stats")
@@ -110,6 +117,22 @@ async def print_stats(database: Database, mode: str | None = None) -> None:
                 f"{pnl:>10} {roi:>9}"
             )
     print()
+
+
+async def reconcile_live_settlements(
+    settings: Settings, database: Database
+) -> None:
+    await database.initialize()
+    service = TradingService(settings, database)
+    try:
+        counts = await service.reconcile_live_settlements()
+    finally:
+        await service.stop()
+    print(
+        "US live settlement reconciliation complete: "
+        f"settled={counts['settled']} reopened={counts['reopened']} "
+        f"errors={counts['errors']}"
+    )
 
 
 def _format_value(value: Any, kind: str) -> str:

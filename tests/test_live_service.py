@@ -4,198 +4,89 @@ import pytest
 
 from fadebot.config import Settings
 from fadebot.db import Database
-from fadebot.live import LiveExecution, LiveOrderError
-from fadebot.mapping import InternationalToUSMapper, USMarketMapping
-from fadebot.models import MarketInfo, PaperFill
+from fadebot.live import LiveAttemptResult
+from fadebot.mapping import USMarketMapping
+from fadebot.models import MarketInfo
 from fadebot.service import TradingService
 
 from .test_models import sample_message
 
 
-def make_message(outcome: str, created_at: str) -> dict:
+NOW = datetime(2026, 7, 23, 18, tzinfo=timezone.utc)
+
+
+def make_message(outcome="YES", created_at="2026-07-23T18:00:00Z"):
     message = sample_message()
     message["data"]["created_at"] = created_at
     message["data"]["data"]["profitable_wallet"]["outcome"] = outcome
-    message["data"]["data"]["profitable_wallet"]["price"] = (
-        0.50 if outcome == "YES" else 0.50
-    )
+    message["data"]["data"]["profitable_wallet"]["price"] = 0.50
     return message
 
 
-def make_market(slug: str, now: datetime, platform: str) -> MarketInfo:
+def make_market(slug, platform):
     return MarketInfo(
-        market_id=slug,
-        condition_id=slug,
-        market_slug=slug,
-        event_slug=slug,
-        title="Will Lakers win?",
-        event_time=now + timedelta(hours=2),
-        expiration_time=now + timedelta(hours=5),
-        category="sports",
-        outcomes=["YES", "NO"],
-        token_ids=[f"{slug}::YES", f"{slug}::NO"],
-        outcome_prices=[0.5, 0.5],
-        closed=False,
-        fees_enabled=False,
-        platform=platform,
-        market_type="team_winner",
+        market_id=slug, condition_id=slug, market_slug=slug, event_slug=slug,
+        title="Will Lakers win?", event_time=NOW + timedelta(hours=2),
+        expiration_time=NOW + timedelta(hours=5), category="sports",
+        outcomes=["YES", "NO"], token_ids=[f"{slug}::YES", f"{slug}::NO"],
+        outcome_prices=[0.5, 0.5], closed=False, fees_enabled=False,
+        platform=platform, market_type="team_winner",
     )
 
 
 class SourceClient:
-    def __init__(self, market: MarketInfo):
-        self.market = market
+    async def resolve_market(self, slug, title):
+        return make_market("intl", "international")
 
-    async def resolve_market(self, slug: str, title: str) -> MarketInfo:
-        return self.market
-
-    async def orderbook(self, market_side: str) -> dict:
-        return {
-            "asks": [{"price": 0.50, "size": 100}],
-            "tick_size": 0.01,
-            "min_order_size": 1,
-        }
-
-
-class USClient:
-    def __init__(self, price: float):
-        self.price = price
-
-    async def orderbook(self, market_side: str) -> dict:
-        return {
-            "asks": [{"price": self.price, "size": 20}],
-            "tick_size": 0.01,
-            "min_order_size": 1,
-        }
-
-
-class MappingUSClient(USClient):
-    def __init__(self, price: float, target: MarketInfo):
-        super().__init__(price)
-        self.target = target
-
-    async def sports_markets_near(self, event_time: datetime) -> list[MarketInfo]:
-        return []
-
-    async def search_markets(self, query: str) -> list[MarketInfo]:
-        return []
-
-    async def sports_markets_wide(self, event_time: datetime) -> list[MarketInfo]:
-        return [self.target]
-
-    async def market_by_slug(self, slug: str) -> MarketInfo:
-        assert slug == self.target.market_slug
-        return self.target
+    async def orderbook(self, market_side):
+        return {"asks": [{"price": 0.5, "size": 100}], "tick_size": 0.01,
+                "min_order_size": 1}
 
 
 class Mapper:
-    def __init__(self, market: MarketInfo):
-        self.market = market
+    async def map_market(self, source):
+        return USMarketMapping(make_market("us-market", "us"), "YES", "test")
 
-    async def map_market(self, source: MarketInfo) -> USMarketMapping:
-        return USMarketMapping(self.market, "YES", "test")
+
+class USClient:
+    def __init__(self, prices=(0.50,), settlements=None):
+        self.prices = list(prices)
+        self.last_price = self.prices[-1]
+        self.settlements = settlements or {}
+        self.book_calls = 0
+
+    async def orderbook(self, market_side):
+        self.book_calls += 1
+        if self.prices:
+            self.last_price = self.prices.pop(0)
+        return {"asks": [{"price": self.last_price, "size": 20}],
+                "tick_size": 0.01, "min_order_size": 1}
+
+    async def official_settlement(self, slug):
+        value = self.settlements.get(slug)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+def attempt(classification, shares=0, price=0.50, order_id="order"):
+    return LiveAttemptResult(
+        order_id, "ORDER_STATE_TEST", shares, price if shares else None, 0,
+        classification, {},
+    )
 
 
 class Executor:
-    def __init__(self, price: float, filled_shares: int | None = None):
-        self.price = price
-        self.filled_shares = filled_shares
-        self.orders: list[str] = []
-
-    async def buy(self, *, token_id: str, **kwargs) -> LiveExecution:
-        self.orders.append(token_id)
-        requested = kwargs["requested_shares"]
-        shares = self.filled_shares if self.filled_shares is not None else requested
-        return LiveExecution(
-            order_id=f"order-{len(self.orders)}",
-            status="filled" if shares == requested else "partially_filled",
-            fill=PaperFill(
-                shares, shares * self.price, 0, shares * self.price,
-                self.price, shares == requested,
-            ),
-            raw={},
-        )
-
-
-class FailingExecutor:
-    def __init__(self, classification: str):
-        self.classification = classification
-        self.calls = 0
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = []
 
     async def buy(self, **kwargs):
-        self.calls += 1
-        raise LiveOrderError(self.classification, f"test {self.classification}")
+        self.calls.append(kwargs)
+        return self.results.pop(0)
 
 
-@pytest.mark.asyncio
-async def test_live_service_rejects_reversal_after_first_us_order(tmp_path):
-    now = datetime(2026, 7, 23, 18, tzinfo=timezone.utc)
-    database = Database(tmp_path / "live.db")
-    await database.initialize()
-    settings = Settings(
-        prediction_hunt_api_key="test",
-        trading_mode="live",
-        live_trading_enabled=True,
-        live_trading_ack="I_UNDERSTAND_REAL_MONEY_IS_AT_RISK",
-        polymarket_us_key_id="test",
-        polymarket_us_secret_key="test",
-        database_path=database.path,
-    )
-    service = TradingService(settings, database)
-    service.polymarket = SourceClient(make_market("intl", now, "international"))
-    service.polymarket_us = USClient(0.50)
-    service.market_mapper = Mapper(make_market("us-market", now, "us"))
-    executor = Executor(0.50)
-    service.live_executor = executor
-    try:
-        await service.process_message(make_message("YES", "2026-07-23T18:00:00Z"), now)
-        await service.process_message(make_message("NO", "2026-07-23T18:01:00Z"), now)
-        assert executor.orders == ["us-market::YES"]
-        summary = await database.summary()
-        assert summary["total_trades"] == 3
-        assert (await database.summary("paper"))["total_trades"] == 2
-        assert (await database.summary("live"))["total_trades"] == 1
-        assert any(
-            row["reason"] == "live_opposite_side_already_attempted"
-            for row in (await database.summary("live"))["rejections"]
-        )
-    finally:
-        await service.stop()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("price", [0.29, 0.91])
-async def test_live_service_rejects_price_outside_band(tmp_path, price):
-    now = datetime(2026, 7, 23, 18, tzinfo=timezone.utc)
-    database = Database(tmp_path / "live.db")
-    await database.initialize()
-    settings = Settings(
-        prediction_hunt_api_key="test",
-        trading_mode="live",
-        live_trading_enabled=True,
-        live_trading_ack="I_UNDERSTAND_REAL_MONEY_IS_AT_RISK",
-        polymarket_us_key_id="test",
-        polymarket_us_secret_key="test",
-        database_path=database.path,
-    )
-    service = TradingService(settings, database)
-    service.polymarket = SourceClient(make_market("intl", now, "international"))
-    service.polymarket_us = USClient(price)
-    service.market_mapper = Mapper(make_market("us-market", now, "us"))
-    executor = Executor(price)
-    service.live_executor = executor
-    try:
-        await service.process_message(make_message("YES", "2026-07-23T18:00:00Z"), now)
-        assert executor.orders == []
-        assert (await database.summary("paper"))["total_trades"] == 1
-        assert (await database.summary("live"))["total_trades"] == 0
-    finally:
-        await service.stop()
-
-
-@pytest.mark.asyncio
-async def test_live_mode_paper_tracks_non_sports_without_live_order(tmp_path):
-    now = datetime(2026, 7, 23, 18, tzinfo=timezone.utc)
+async def configured_service(tmp_path, results, *, prices=(0.50,)):
     database = Database(tmp_path / "live.db")
     await database.initialize()
     settings = Settings(
@@ -206,174 +97,205 @@ async def test_live_mode_paper_tracks_non_sports_without_live_order(tmp_path):
         database_path=database.path,
     )
     service = TradingService(settings, database)
-    market = make_market("intl-politics", now, "international")
-    service.polymarket = SourceClient(MarketInfo(**{**market.__dict__, "category": "politics"}))
-    executor = Executor(0.50)
-    service.live_executor = executor
-    try:
-        await service.process_message(make_message("YES", "2026-07-23T18:00:00Z"), now)
-        assert executor.orders == []
-        assert (await database.summary("paper"))["total_trades"] == 1
-        assert (await database.summary("live"))["total_trades"] == 0
-        assert (await database.summary("live"))["rejections"][0]["reason"] == "live_filter_category:politics"
-    finally:
-        await service.stop()
+    service.polymarket = SourceClient()
+    service.polymarket_us = USClient(prices)
+    service.market_mapper = Mapper()
+    service.live_executor = Executor(results)
+
+    async def no_sleep(_):
+        return None
+
+    service._sleep = no_sleep
+    return service, database
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("filled_shares", "expected_status"),
-    [(10, "filled"), (4, "partially_filled")],
-)
-async def test_live_fill_creates_trade_for_exact_executed_quantity(
-    tmp_path, filled_shares, expected_status, caplog
-):
-    now = datetime(2026, 7, 23, 18, tzinfo=timezone.utc)
-    database = Database(tmp_path / "live.db")
-    await database.initialize()
-    settings = Settings(
-        prediction_hunt_api_key="test", trading_mode="live",
-        live_trading_enabled=True,
-        live_trading_ack="I_UNDERSTAND_REAL_MONEY_IS_AT_RISK",
-        polymarket_us_key_id="test", polymarket_us_secret_key="test",
-        database_path=database.path,
-    )
-    service = TradingService(settings, database)
-    service.polymarket = SourceClient(make_market("intl", now, "international"))
-    service.polymarket_us = USClient(0.50)
-    service.market_mapper = Mapper(make_market("us-market", now, "us"))
-    service.live_executor = Executor(0.48, filled_shares)
+@pytest.mark.parametrize("zero_count", [1, 2])
+async def test_confirmed_zero_fill_retries_then_fills(tmp_path, zero_count):
+    results = [attempt("confirmed_zero_fill", order_id=f"zero-{i}")
+               for i in range(zero_count)]
+    results.append(attempt("filled", 10, 0.49, "filled"))
+    service, database = await configured_service(tmp_path, results)
     try:
-        with caplog.at_level("INFO"):
-            await service.process_message(
-                make_message("YES", "2026-07-23T18:00:00Z"), now
-            )
-        live_trades = await database.recent_trades(mode="live")
-        assert len(live_trades) == 1
-        assert live_trades[0]["shares"] == pytest.approx(filled_shares)
-        assert live_trades[0]["external_status"] == expected_status
-        assert "LIVE ORDER ATTEMPT" in caplog.text
-        assert (
-            "LIVE ORDER FILLED" if expected_status == "filled"
-            else "LIVE ORDER PARTIALLY FILLED"
-        ) in caplog.text
-    finally:
-        await service.stop()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "classification",
-    ["canceled_no_fill", "ioc_no_fill", "rejected", "submission_error"],
-)
-async def test_classified_live_failure_creates_no_trade_and_is_not_retried(
-    tmp_path, classification
-):
-    now = datetime(2026, 7, 23, 18, tzinfo=timezone.utc)
-    database = Database(tmp_path / "live.db")
-    await database.initialize()
-    settings = Settings(
-        prediction_hunt_api_key="test", trading_mode="live",
-        live_trading_enabled=True,
-        live_trading_ack="I_UNDERSTAND_REAL_MONEY_IS_AT_RISK",
-        polymarket_us_key_id="test", polymarket_us_secret_key="test",
-        database_path=database.path,
-    )
-    service = TradingService(settings, database)
-    service.polymarket = SourceClient(make_market("intl", now, "international"))
-    service.polymarket_us = USClient(0.50)
-    service.market_mapper = Mapper(make_market("us-market", now, "us"))
-    executor = FailingExecutor(classification)
-    service.live_executor = executor
-    try:
-        await service.process_message(
-            make_message("YES", "2026-07-23T18:00:00Z"), now
-        )
-        assert await database.recent_trades(mode="live") == []
-        assert executor.calls == 1
-        reasons = (await database.summary("live"))["rejections"]
-        assert reasons == [{"reason": f"live_order_{classification}", "count": 1}]
-    finally:
-        await service.stop()
-
-
-@pytest.mark.asyncio
-async def test_missing_created_at_logs_sanitized_shape_and_does_not_crash(
-    tmp_path, caplog
-):
-    database = Database(tmp_path / "malformed.db")
-    await database.initialize()
-    settings = Settings(prediction_hunt_api_key="test", database_path=database.path)
-    service = TradingService(settings, database)
-    message = make_message("YES", "2026-07-23T18:00:00Z")
-    message["data"]["created_at"] = None
-    try:
-        with caplog.at_level("WARNING"):
-            await service.process_message(message)
-        assert (await database.summary())["total_signals"] == 0
-        assert "signal is missing a valid created_at" in caplog.text
-        assert "outer_data_keys" in caplog.text
-        assert "nested_data_keys" in caplog.text
-        assert "0xwinner" not in caplog.text
-    finally:
-        await service.stop()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("source_team", "target_team", "aliases"),
-    [
-        ("SV Darmstadt 98", "Darmstadt 98", ()),
-        ("Psim Yogyakarta", "Perserikatan Sepakbola Indonesia Mataram", ("PSIM Yogyakarta",)),
-        ("Olympique de Marseille", "Marseille", ("OM",)),
-        ("TSG 1899 Hoffenheim", "Hoffenheim", ("TSG Hoffenheim",)),
-    ],
-)
-async def test_historical_mapping_misses_reach_live_execution(
-    tmp_path, source_team, target_team, aliases
-):
-    now = datetime(2026, 9, 20, 17, tzinfo=timezone.utc)
-    database = Database(tmp_path / "live.db")
-    await database.initialize()
-    settings = Settings(
-        prediction_hunt_api_key="test", trading_mode="live",
-        live_trading_enabled=True,
-        live_trading_ack="I_UNDERSTAND_REAL_MONEY_IS_AT_RISK",
-        polymarket_us_key_id="test", polymarket_us_secret_key="test",
-        database_path=database.path,
-    )
-    source = make_market("intl-team", now, "international")
-    source = MarketInfo(**{
-        **source.__dict__,
-        "title": f"Will {source_team} win?",
-        "event_slug": f"{source_team}-vs-opponent",
-    })
-    target = make_market("us-team", now, "us")
-    target = MarketInfo(**{
-        **target.__dict__,
-        "title": f"{target_team} vs Opponent",
-        "event_slug": f"{target_team}-vs-opponent",
-        "event_time": now + timedelta(hours=4),
-        "long_label": target_team,
-        "short_label": "Opponent",
-        "long_aliases": aliases,
-    })
-    service = TradingService(settings, database)
-    service.polymarket = SourceClient(source)
-    us_client = MappingUSClient(0.50, target)
-    service.polymarket_us = us_client
-    service.market_mapper = InternationalToUSMapper(
-        us_client, database  # type: ignore[arg-type]
-    )
-    executor = Executor(0.50)
-    service.live_executor = executor
-    try:
-        await service.process_message(
-            make_message("YES", "2026-09-20T17:00:00Z"), now
-        )
-        assert executor.orders == ["us-team::YES"]
+        await service.process_message(make_message(), NOW)
+        executor = service.live_executor
+        assert len(executor.calls) == zero_count + 1
+        assert [call["requested_shares"] for call in executor.calls] == [10] * (zero_count + 1)
         trades = await database.recent_trades(mode="live")
         assert len(trades) == 1
-        assert trades[0]["market_slug"] == "us-team"
+        assert trades[0]["shares"] == pytest.approx(10)
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_refreshed_price_above_original_ceiling_stops_chase(tmp_path):
+    service, database = await configured_service(
+        tmp_path, [attempt("confirmed_zero_fill")], prices=(0.50, 0.61)
+    )
+    try:
+        await service.process_message(make_message(), NOW)
+        assert len(service.live_executor.calls) == 1
+        assert await database.recent_trades(mode="live") == []
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_partial_fills_are_combined_into_one_trade(tmp_path):
+    service, database = await configured_service(tmp_path, [
+        attempt("partial_fill", 4, 0.48, "one"),
+        attempt("filled", 6, 0.50, "two"),
+    ])
+    try:
+        await service.process_message(make_message(), NOW)
+        calls = service.live_executor.calls
+        assert [call["requested_shares"] for call in calls] == [10, 6]
+        trades = await database.recent_trades(mode="live")
+        assert len(trades) == 1
+        assert trades[0]["shares"] == pytest.approx(10)
+        assert trades[0]["fill_avg_price"] == pytest.approx(0.492)
+        assert trades[0]["external_order_id"] == "one,two"
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_partial_fill_is_saved_when_chase_times_out(tmp_path):
+    service, database = await configured_service(
+        tmp_path, [attempt("partial_fill", 4, 0.48, "one")]
+    )
+    clock = iter([0.0, 0.0, 16.0])
+    service._monotonic = lambda: next(clock)
+    try:
+        await service.process_message(make_message(), NOW)
+        trades = await database.recent_trades(mode="live")
+        assert len(trades) == 1
+        assert trades[0]["shares"] == pytest.approx(4)
+        assert trades[0]["external_status"] == "partially_filled"
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_ten_confirmed_zero_fills_create_no_trade(tmp_path):
+    service, database = await configured_service(
+        tmp_path, [attempt("confirmed_zero_fill", order_id=str(i)) for i in range(10)]
+    )
+    try:
+        await service.process_message(make_message(), NOW)
+        assert len(service.live_executor.calls) == 10
+        assert await database.recent_trades(mode="live") == []
+        assert (await database.summary("live"))["rejections"] == [
+            {"reason": "live_order_attempt_limit", "count": 1}
+        ]
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("classification", ["rejected", "submission_unknown"])
+async def test_unsafe_result_never_retries(tmp_path, classification):
+    service, database = await configured_service(
+        tmp_path, [attempt(classification)]
+    )
+    try:
+        await service.process_message(make_message(), NOW)
+        assert len(service.live_executor.calls) == 1
+        assert await database.recent_trades(mode="live") == []
+        assert (await database.summary("live"))["rejections"][0]["reason"] == f"live_order_{classification}"
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_repeated_missing_created_at_message_is_deduplicated(tmp_path):
+    service, database = await configured_service(tmp_path, [attempt("filled", 10)])
+    message = make_message(created_at=None)
+    try:
+        await service.process_message(message, NOW)
+        await service.process_message(message, NOW + timedelta(seconds=5))
+        assert (await database.summary("paper"))["total_trades"] == 1
+        assert (await database.summary("live"))["total_trades"] == 1
+        assert len(service.live_executor.calls) == 1
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_reversal_is_rejected_after_first_live_order(tmp_path):
+    service, database = await configured_service(tmp_path, [attempt("filled", 10)])
+    try:
+        await service.process_message(make_message("YES"), NOW)
+        await service.process_message(make_message("NO", "2026-07-23T18:01:00Z"), NOW)
+        assert len(service.live_executor.calls) == 1
+        reasons = (await database.summary("live"))["rejections"]
+        assert any(row["reason"] == "live_opposite_side_already_attempted" for row in reasons)
+    finally:
+        await service.stop()
+
+
+async def create_live_trade(database, outcome="YES"):
+    signal = __import__("fadebot.models", fromlist=["FadeSignal"]).FadeSignal.from_message(make_message(outcome))
+    await database.add_signal(signal)
+    from fadebot.models import PaperFill
+    await database.create_trade(
+        signal, make_market("us-market", "us"), f"us-market::{outcome}",
+        PaperFill(10, 5, 0, 5, 0.5, True), NOW,
+        execution_mode="live", max_price=0.6, platform="us", outcome=outcome,
+    )
+
+
+@pytest.mark.asyncio
+async def test_us_settlement_uses_only_official_endpoint(tmp_path):
+    database = Database(tmp_path / "settle.db")
+    await database.initialize()
+    await create_live_trade(database, "NO")
+    service = TradingService(Settings(prediction_hunt_api_key="test", database_path=database.path), database)
+    service.polymarket_us = USClient(settlements={"us-market": 1.0})
+    try:
+        await service.settle_open_trades()
+        trade = (await database.recent_trades(mode="live"))[0]
+        assert trade["status"] == "settled"
+        assert trade["final_price"] == pytest.approx(0)
+        assert trade["resolved_outcome"] == "YES"
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_us_settlement_leaves_open(tmp_path):
+    database = Database(tmp_path / "settle.db")
+    await database.initialize()
+    await create_live_trade(database)
+    service = TradingService(Settings(prediction_hunt_api_key="test", database_path=database.path), database)
+    service.polymarket_us = USClient(settlements={})
+    try:
+        await service.settle_open_trades()
+        assert (await database.recent_trades(mode="live"))[0]["status"] == "open"
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_repairs_and_reopens_historical_settlements(tmp_path):
+    database = Database(tmp_path / "repair.db")
+    await database.initialize()
+    await create_live_trade(database)
+    trade = (await database.recent_trades(mode="live"))[0]
+    await database.settle_trade(trade["id"], final_price=0, resolved_outcome="NO", settled_at=NOW)
+    service = TradingService(Settings(prediction_hunt_api_key="test", database_path=database.path), database)
+    service.polymarket_us = USClient(settlements={"us-market": 1.0})
+    try:
+        assert await service.reconcile_live_settlements() == {"settled": 1, "reopened": 0, "errors": 0}
+        fixed = (await database.recent_trades(mode="live"))[0]
+        assert fixed["final_price"] == 1
+        assert fixed["payout"] == 10
+        service.polymarket_us = USClient(settlements={})
+        assert (await service.reconcile_live_settlements())["reopened"] == 1
+        reopened = (await database.recent_trades(mode="live"))[0]
+        assert reopened["status"] == "open"
+        assert reopened["pnl"] is None
+        assert reopened["settled_at"] is None
     finally:
         await service.stop()

@@ -70,3 +70,27 @@ def test_invalid_message_rejected():
     with pytest.raises(ValueError, match="not a fade_finder"):
         FadeSignal.from_message(message)
 
+
+def test_missing_created_at_uses_websocket_timestamp():
+    message = sample_message()
+    message["data"]["created_at"] = None
+    signal = FadeSignal.from_message(
+        message, datetime(2030, 1, 1, tzinfo=timezone.utc)
+    )
+    assert signal.created_at == datetime.fromtimestamp(
+        message["ts"], tz=timezone.utc
+    )
+
+
+def test_received_time_fallback_does_not_change_signal_identity():
+    message = sample_message()
+    message["data"]["created_at"] = None
+    message["ts"] = None
+    first = FadeSignal.from_message(
+        message, datetime(2026, 1, 1, tzinfo=timezone.utc)
+    )
+    second = FadeSignal.from_message(
+        message, datetime(2026, 1, 2, tzinfo=timezone.utc)
+    )
+    assert first.created_at != second.created_at
+    assert first.signal_id == second.signal_id

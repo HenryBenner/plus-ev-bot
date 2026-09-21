@@ -116,14 +116,12 @@ async def test_date_bounded_sports_lookup_uses_event_time():
 
 
 @pytest.mark.asyncio
-async def test_closed_market_uses_us_settlement_endpoint():
+async def test_market_lookup_does_not_use_settlement_as_quote_data():
     closed = {**MARKET, "closed": True, "active": False}
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/market/slug/us-test-market":
             return httpx.Response(200, json={"market": closed})
-        if request.url.path.endswith("/settlement"):
-            return httpx.Response(200, json={"settlement": 1})
         raise AssertionError(request.url)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
@@ -131,7 +129,23 @@ async def test_closed_market_uses_us_settlement_endpoint():
             "us-test-market"
         )
         assert market.closed
-        assert market.outcome_prices == [1.0, 0.0]
+        assert market.outcome_prices == [0.4, 0.6]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status", "expected"), [(200, 1.0), (404, None)])
+async def test_official_us_settlement_endpoint(status, expected):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/markets/us-test-market/settlement"
+        if status == 404:
+            return httpx.Response(404)
+        return httpx.Response(200, json={"settlement": 1})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await PolymarketUSClient(settings(), http).official_settlement(
+            "us-test-market"
+        )
+    assert result == expected
 
 
 def test_us_sports_market_uses_nested_team_identity():

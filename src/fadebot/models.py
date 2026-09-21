@@ -59,7 +59,12 @@ class FadeSignal:
         payload = outer.get("data") or {}
         profitable = payload.get("profitable_wallet") or {}
         losing = payload.get("losing_wallet") or {}
-        created_at = parse_datetime(outer.get("created_at"))
+        explicit_created_at = parse_datetime(outer.get("created_at"))
+        source_ts = _optional_float(message.get("ts"))
+        websocket_created_at = _timestamp_datetime(source_ts)
+        created_at = explicit_created_at or websocket_created_at or (
+            received_at or datetime.now(timezone.utc)
+        ).astimezone(timezone.utc)
         market_slug = str(
             outer.get("market_slug") or payload.get("marketSlug") or ""
         ).strip()
@@ -67,8 +72,6 @@ class FadeSignal:
         side = str(profitable.get("side") or "BUY").strip().upper()
         price = float(profitable.get("price"))
 
-        if not created_at:
-            raise ValueError("signal is missing a valid created_at")
         if not market_slug:
             raise ValueError("signal is missing market_slug")
         if not 0 < price < 1:
@@ -79,7 +82,14 @@ class FadeSignal:
             raise ValueError("profitable wallet side must be BUY or SELL")
 
         identity = {
-            "created_at": created_at.isoformat(),
+            # Keep IDs compatible for ordinary messages. If both source
+            # timestamps are absent, None avoids tying deduplication to the
+            # local receipt time, which changes after reconnects.
+            "created_at": (
+                created_at.isoformat()
+                if explicit_created_at or websocket_created_at
+                else None
+            ),
             "event_id": outer.get("event_id"),
             "group_id": outer.get("group_id"),
             "market_slug": market_slug,
@@ -96,7 +106,7 @@ class FadeSignal:
             received_at=(received_at or datetime.now(timezone.utc)).astimezone(
                 timezone.utc
             ),
-            source_ts=float(message["ts"]) if message.get("ts") is not None else None,
+            source_ts=source_ts,
             created_at=created_at,
             event_id=_optional_int(outer.get("event_id")),
             group_id=_optional_int(outer.get("group_id")),
@@ -136,7 +146,21 @@ def _optional_int(value: Any) -> int | None:
 
 
 def _optional_float(value: Any) -> float | None:
-    return float(value) if value is not None else None
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _timestamp_datetime(value: float | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        # Accept conventional seconds and millisecond websocket timestamps.
+        seconds = value / 1000 if value > 10_000_000_000 else value
+        return datetime.fromtimestamp(seconds, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)

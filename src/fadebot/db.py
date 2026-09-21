@@ -380,6 +380,13 @@ class Database:
             "SELECT * FROM trades WHERE status = 'open' ORDER BY filled_at"
         )
 
+    async def live_us_trades(self) -> list[dict[str, Any]]:
+        return await self._fetchall(
+            """SELECT * FROM trades
+               WHERE execution_mode = 'live' AND platform = 'us'
+               ORDER BY filled_at"""
+        )
+
     async def settle_trade(
         self,
         trade_id: int,
@@ -416,6 +423,58 @@ class Database:
                     settled_at.isoformat(),
                     trade_id,
                 ),
+            )
+            await db.commit()
+
+    async def reconcile_trade_settlement(
+        self,
+        trade_id: int,
+        *,
+        final_price: float,
+        resolved_outcome: str,
+        settled_at: datetime,
+    ) -> None:
+        """Write an official settlement even if a prior settlement was wrong."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (
+                await db.execute(
+                    "SELECT shares, cost_basis FROM trades WHERE id = ?",
+                    (trade_id,),
+                )
+            ).fetchone()
+            if not row:
+                return
+            payout = float(row["shares"]) * final_price
+            cost_basis = float(row["cost_basis"])
+            pnl = payout - cost_basis
+            roi = pnl / cost_basis if cost_basis else None
+            await db.execute(
+                """UPDATE trades SET
+                       status='settled', resolved_outcome=?, final_price=?,
+                       payout=?, pnl=?, roi=?, settled_at=?
+                   WHERE id=?""",
+                (
+                    resolved_outcome,
+                    final_price,
+                    payout,
+                    pnl,
+                    roi,
+                    settled_at.isoformat(),
+                    trade_id,
+                ),
+            )
+            await db.commit()
+
+    async def reopen_trade(self, trade_id: int) -> None:
+        """Clear unconfirmed settlement data and return a trade to polling."""
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """UPDATE trades SET
+                       status='open', resolved_outcome=NULL, final_price=NULL,
+                       payout=NULL, pnl=NULL, roi=NULL, settled_at=NULL
+                   WHERE id=?""",
+                (trade_id,),
             )
             await db.commit()
 

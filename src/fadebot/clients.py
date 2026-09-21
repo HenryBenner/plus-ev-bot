@@ -200,18 +200,21 @@ class PolymarketUSClient:
         response.raise_for_status()
         market = response.json().get("market") or response.json()
         info = _us_market(market, {})
-        if info.closed:
-            settlement = await self._get(
-                f"{self.settings.polymarket_us_gateway_url}"
-                f"/v1/markets/{info.market_slug}/settlement"
-            )
-            if settlement.status_code == 200:
-                yes_price = float(settlement.json()["settlement"])
-                info = MarketInfo(**{
-                    **info.__dict__,
-                    "outcome_prices": [yes_price, 1.0 - yes_price],
-                })
         return self._remember(info)
+
+    async def official_settlement(self, slug: str) -> float | None:
+        """Return the official YES settlement, or None while unavailable."""
+        response = await self._get(
+            f"{self.settings.polymarket_us_gateway_url}"
+            f"/v1/markets/{slug}/settlement"
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        value = float(response.json()["settlement"])
+        if not 0 <= value <= 1:
+            raise ValueError(f"Invalid US settlement price for {slug}: {value}")
+        return value
 
     async def orderbook(self, market_side: str) -> dict[str, Any]:
         slug, outcome = split_us_market_side(market_side)

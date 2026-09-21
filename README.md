@@ -158,10 +158,13 @@ LIVE_CATEGORY_FILTERS=sports
 LIVE_MARKET_TYPE_FILTERS=team_winner
 ```
 
-Live entries use immediate-or-cancel limit orders with the same price ceiling, so
-available liquidity may fill partially and the remainder is cancelled. Failed
-submissions are not automatically retried, avoiding accidental duplicate
-real-money orders. Validate with a dedicated low-balance wallet before use.
+Live entries use immediate-or-cancel limit orders with the original signal price
+ceiling. A confirmed zero fill starts a bounded chase: the bot refreshes the
+book, waits 250 ms, and tries again for up to 10 attempts or 15 seconds. Partial
+fills reduce the next order quantity and are combined into one trade. Explicit
+rejections stop the chase. A timeout or connection failure during submission is
+recorded as `submission_unknown` and is never retried because the server may
+have accepted the order.
 
 The live-only entry band checks the mapped US market's best executable price
 before submission; `0.30` to `0.90` means 30¢ through 90¢ inclusive. The upper
@@ -190,6 +193,15 @@ dimension. Inspect separate performance with `python -m fadebot.main stats
 combined stats. Live filter/order rejections are tracked separately from paper
 rejections.
 
+Polymarket US trades remain open until the official settlement endpoint returns
+a result. A 404 means settlement is not available yet. To repair historical US
+live settlements using that endpoint, including reopening trades whose official
+settlement is unavailable, run:
+
+```bash
+python -m fadebot.main reconcile-live-settlements
+```
+
 ## International to US mapping
 
 The live mapper follows the strict configuration principle used by
@@ -210,14 +222,16 @@ The live mapper follows the strict configuration principle used by
 ## Accounting notes
 
 - Paper mode's $10 amount is a maximum cash outlay, not a guaranteed fill.
-- Live mode submits up to `LIVE_SHARES_PER_TRADE` contracts with IOC execution;
-  a thin book can produce a partial fill.
+- Live mode targets `LIVE_SHARES_PER_TRADE` contracts through bounded IOC
+  attempts; a thin or moving book can still produce a saved partial fill.
 - Paper entries use the order book available when the worker handles the
   signal—not the earlier wallet execution price.
 - The 10-cent guard is measured from the normalized buy price. For example,
   `SELL YES at 0.70` becomes `BUY NO at 0.30`, with a 0.40 maximum.
 - Payout is shares multiplied by the selected outcome's final price on the
   platform recorded for that trade, including split or void resolutions.
+- Polymarket US order and execution prices are YES prices. BUY_SHORT fills are
+  converted to the selected NO outcome's economic cost with `1 - YES price`.
 - Portfolio ROI is settled P&L divided by settled cost basis.
 
 Prediction Hunt provides a WebSocket channel, not an incoming webhook. The

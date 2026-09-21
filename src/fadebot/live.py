@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,26 +17,37 @@ FILL_EXECUTION_TYPES = {
     "EXECUTION_TYPE_PARTIAL_FILL",
     "EXECUTION_TYPE_FILL",
 }
-
-
-class LiveOrderError(RuntimeError):
-    """A classified live-order outcome that must never be retried automatically."""
-
-    def __init__(self, classification: str, message: str):
-        super().__init__(message)
-        self.classification = classification
+FINAL_ZERO_STATES = {"ORDER_STATE_CANCELED", "ORDER_STATE_EXPIRED"}
+PENDING_STATES = {
+    "ORDER_STATE_NEW",
+    "ORDER_STATE_PENDING_NEW",
+    "ORDER_STATE_PENDING_REPLACE",
+    "ORDER_STATE_PENDING_CANCEL",
+    "ORDER_STATE_PENDING_RISK",
+}
+RECONCILE_POLL_SECONDS = 0.1
+RECONCILE_MAX_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
-class LiveExecution:
+class LiveAttemptResult:
     order_id: str
-    status: str
-    fill: PaperFill
+    state: str
+    filled_shares: float
+    average_price: float | None
+    fee: float
+    classification: str
     raw: dict[str, Any]
+
+    @property
+    def notional(self) -> float:
+        if self.average_price is None:
+            return 0.0
+        return self.filled_shares * self.average_price
 
 
 class PolymarketLiveExecutor:
-    """Explicitly gated Polymarket US immediate-or-cancel executor."""
+    """Submit and reconcile exactly one Polymarket US IOC order."""
 
     def __init__(self, settings: Settings):
         settings.validate_live_mode()
@@ -50,7 +62,7 @@ class PolymarketLiveExecutor:
         requested_shares: int,
         tick_size: str,
         neg_risk: bool,
-    ) -> LiveExecution:
+    ) -> LiveAttemptResult:
         del tick_size, neg_risk
         return await asyncio.to_thread(
             self._buy_sync, token_id, max_price, requested_shares
@@ -61,14 +73,15 @@ class PolymarketLiveExecutor:
         token_id: str,
         max_price: float,
         requested_shares: int,
-    ) -> LiveExecution:
+    ) -> LiveAttemptResult:
         market_slug, outcome = _split_market_side(token_id)
         client = self._client or self._build_client()
         self._client = client
         quantity = int(requested_shares)
         if quantity <= 0:
-            raise RuntimeError("Live order quantity must be a positive integer")
+            raise ValueError("Live order quantity must be a positive integer")
 
+        raw_limit_price = _raw_yes_price(outcome, max_price)
         payload = {
             "marketSlug": market_slug,
             "intent": (
@@ -77,7 +90,7 @@ class PolymarketLiveExecutor:
                 else "ORDER_INTENT_BUY_SHORT"
             ),
             "type": "ORDER_TYPE_LIMIT",
-            "price": {"value": f"{max_price:.6f}", "currency": "USD"},
+            "price": {"value": f"{raw_limit_price:.6f}", "currency": "USD"},
             "quantity": quantity,
             "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
             "participateDontInitiate": False,
@@ -94,51 +107,76 @@ class PolymarketLiveExecutor:
                 self.settings.polymarket_us_secret_key,
             )
             logger.error(
-                "Polymarket US order submission error: market=%s intent=%s "
-                "quantity=%s limit_price=%.6f error_type=%s error=%s",
-                market_slug, payload["intent"], quantity, max_price,
-                type(exc).__name__, safe_error,
+                "Polymarket US submission unknown: market=%s intent=%s "
+                "quantity=%s raw_yes_limit=%.6f economic_limit=%.6f "
+                "error_type=%s error=%s",
+                market_slug,
+                payload["intent"],
+                quantity,
+                raw_limit_price,
+                max_price,
+                type(exc).__name__,
+                safe_error,
             )
-            raise LiveOrderError(
-                "submission_error",
-                "Polymarket US order submission failed. It will not be retried "
-                f"automatically to prevent a duplicate order: {safe_error}"
-            ) from exc
+            return LiveAttemptResult(
+                order_id="",
+                state="UNKNOWN",
+                filled_shares=0,
+                average_price=None,
+                fee=0,
+                classification="submission_unknown",
+                raw={"error_type": type(exc).__name__, "error": safe_error},
+            )
 
         diagnostic = _response_diagnostic(raw, payload)
         logger.info("Polymarket US order response: %s", _format_diagnostic(diagnostic))
-        if not isinstance(raw, dict):
-            raise LiveOrderError(
-                "invalid_response",
-                "Polymarket US returned an invalid order response: "
-                + _format_diagnostic(diagnostic),
-            )
-        if not isinstance(raw.get("executions"), list):
-            raise LiveOrderError(
-                "invalid_response",
-                "Polymarket US returned an invalid executions response: "
-                + _format_diagnostic(diagnostic),
-            )
+        immediate = _classify_response(raw, outcome, quantity)
+        if immediate is not None:
+            return immediate
 
-        fill = _fill_from_executions(raw["executions"], requested_shares)
-        if fill is None:
-            classification = _zero_fill_classification(diagnostic)
-            label = {
-                "rejected": "Polymarket US IOC rejected",
-                "canceled_no_fill": "Polymarket US IOC canceled with no fill",
-                "expired_no_fill": "Polymarket US IOC expired with no fill",
-                "ioc_no_fill": "Polymarket US IOC received no fill",
-            }[classification]
-            raise LiveOrderError(
-                classification,
-                f"{label}: {_format_diagnostic(diagnostic)}",
-            )
-        return LiveExecution(
-            order_id=str(raw.get("id") or ""),
-            status="filled" if fill.fully_filled else "partially_filled",
-            fill=fill,
-            raw=raw,
-        )
+        order_id = str(raw.get("id") or "") if isinstance(raw, dict) else ""
+        known_fill = _known_fill(raw, outcome, quantity)
+        if not order_id:
+            return _submission_unknown(raw, known_fill, "UNKNOWN")
+
+        deadline = time.monotonic() + RECONCILE_MAX_SECONDS
+        while True:
+            try:
+                retrieved = client.orders.retrieve(order_id)
+            except Exception as exc:
+                safe_error = _safe_error_text(
+                    exc,
+                    self.settings.polymarket_us_key_id,
+                    self.settings.polymarket_us_secret_key,
+                )
+                logger.error(
+                    "Polymarket US order reconciliation failed: order_id=%s "
+                    "error_type=%s error=%s",
+                    order_id,
+                    type(exc).__name__,
+                    safe_error,
+                )
+                return _submission_unknown(
+                    raw, known_fill, "RETRIEVE_FAILED", order_id
+                )
+
+            reconciled = _classify_response(retrieved, outcome, quantity, order_id)
+            if reconciled is not None:
+                logger.info(
+                    "Polymarket US order reconciled: order_id=%s state=%s "
+                    "classification=%s filled=%.4f",
+                    order_id,
+                    reconciled.state,
+                    reconciled.classification,
+                    reconciled.filled_shares,
+                )
+                return reconciled
+            known_fill = _known_fill(retrieved, outcome, quantity) or known_fill
+            if time.monotonic() >= deadline:
+                return _submission_unknown(
+                    retrieved, known_fill, "RECONCILE_TIMEOUT", order_id
+                )
+            time.sleep(RECONCILE_POLL_SECONDS)
 
     def _build_client(self) -> Any:
         try:
@@ -163,8 +201,124 @@ def _split_market_side(value: str) -> tuple[str, str]:
     return slug, outcome
 
 
+def _raw_yes_price(outcome: str, economic_price: float) -> float:
+    return economic_price if outcome == "YES" else 1.0 - economic_price
+
+
+def _economic_price(outcome: str, raw_yes_price: float) -> float:
+    return raw_yes_price if outcome == "YES" else 1.0 - raw_yes_price
+
+
+def _classify_response(
+    raw: Any,
+    outcome: str,
+    requested_shares: int,
+    fallback_order_id: str = "",
+) -> LiveAttemptResult | None:
+    if not isinstance(raw, dict):
+        return None
+    order_id = str(raw.get("id") or fallback_order_id)
+    executions = raw.get("executions")
+    executions = executions if isinstance(executions, list) else []
+    order = raw.get("order")
+    if not isinstance(order, dict):
+        order = _last_execution_order(executions)
+    state = str(order.get("state") or "") if isinstance(order, dict) else ""
+    fill = _aggregate_fill(order, executions, requested_shares, outcome)
+    filled = fill.shares if fill else 0.0
+    average = fill.average_price if fill else None
+    fee = fill.fee if fill else 0.0
+    execution_types = {
+        str(item.get("type") or "")
+        for item in executions
+        if isinstance(item, dict)
+    }
+
+    if state == "ORDER_STATE_REJECTED" or "EXECUTION_TYPE_REJECTED" in execution_types:
+        return LiveAttemptResult(
+            order_id, state or "ORDER_STATE_REJECTED", filled, average, fee,
+            "rejected", raw,
+        )
+    if state == "ORDER_STATE_FILLED":
+        if filled <= 0 or average is None:
+            return None
+        return LiveAttemptResult(
+            order_id, state, filled, average, fee, "filled", raw
+        )
+    if state == "ORDER_STATE_PARTIALLY_FILLED":
+        if filled <= 0 or average is None:
+            return None
+        return LiveAttemptResult(
+            order_id, state, filled, average, fee, "partial_fill", raw
+        )
+    if state in FINAL_ZERO_STATES:
+        classification = "partial_fill" if filled > 0 else "confirmed_zero_fill"
+        return LiveAttemptResult(
+            order_id, state, filled, average, fee, classification, raw
+        )
+    if state in PENDING_STATES:
+        return None
+
+    if "EXECUTION_TYPE_CANCELED" in execution_types or "EXECUTION_TYPE_EXPIRED" in execution_types:
+        classification = "partial_fill" if filled > 0 else "confirmed_zero_fill"
+        return LiveAttemptResult(
+            order_id, state or "TERMINAL", filled, average, fee, classification, raw
+        )
+    if (
+        filled >= requested_shares - 0.0001
+        and "EXECUTION_TYPE_FILL" in execution_types
+    ):
+        return LiveAttemptResult(
+            order_id, state or "ORDER_STATE_FILLED", filled, average, fee,
+            "filled", raw,
+        )
+    return None
+
+
+def _known_fill(
+    raw: Any, outcome: str, requested_shares: int
+) -> PaperFill | None:
+    if not isinstance(raw, dict):
+        return None
+    executions = raw.get("executions")
+    executions = executions if isinstance(executions, list) else []
+    order = raw.get("order")
+    if not isinstance(order, dict):
+        order = _last_execution_order(executions)
+    return _aggregate_fill(order, executions, requested_shares, outcome)
+
+
+def _aggregate_fill(
+    order: Any,
+    executions: list[Any],
+    requested_shares: int,
+    outcome: str,
+) -> PaperFill | None:
+    execution_fill = _fill_from_executions(executions, requested_shares, outcome)
+    if isinstance(order, dict):
+        shares = _optional_float(order.get("cumQuantity")) or 0
+        raw_average = _amount_value(order.get("avgPx"))
+        if shares > 0 and raw_average is not None:
+            economic_average = _economic_price(outcome, raw_average)
+            fee = _amount_value(order.get("commissionNotionalTotalCollected"))
+            if fee is None:
+                fee = execution_fill.fee if execution_fill else 0.0
+            notional = shares * economic_average
+            return PaperFill(
+                shares=shares,
+                notional=notional,
+                fee=fee,
+                total_cost=notional + fee,
+                average_price=economic_average,
+                fully_filled=shares >= requested_shares - 0.0001,
+            )
+    return execution_fill
+
+
 def _fill_from_executions(
-    executions: list[dict[str, Any]], requested_shares: int
+    executions: list[Any],
+    requested_shares: int,
+    outcome: str = "YES",
 ) -> PaperFill | None:
     shares = 0.0
     notional = 0.0
@@ -173,59 +327,57 @@ def _fill_from_executions(
         if not isinstance(execution, dict):
             continue
         execution_type = str(execution.get("type") or "")
-        # The REST API documents lastShares and lastPx on fill executions.
-        # tradeId is useful evidence but is not required: some SDK/API response
-        # variants identify fills by their execution type alone.
         if execution_type not in FILL_EXECUTION_TYPES and not execution.get("tradeId"):
             continue
         quantity = _optional_float(execution.get("lastShares")) or 0
-        price = _amount_value(execution.get("lastPx"))
-        if quantity <= 0 or price is None:
+        raw_price = _amount_value(execution.get("lastPx"))
+        if quantity <= 0 or raw_price is None:
             continue
+        price = _economic_price(outcome, raw_price)
         shares += quantity
         notional += quantity * price
         fee += _amount_value(execution.get("commissionNotionalCollected")) or 0
-
-    # A synchronous response can expose the aggregate fill on the nested order
-    # even if it omits per-fill values. Use only one final order snapshot here
-    # so cumulative quantity is not double counted across executions.
-    if shares <= 0:
-        for execution in reversed(executions):
-            if not isinstance(execution, dict):
-                continue
-            order = execution.get("order")
-            if not isinstance(order, dict):
-                continue
-            cumulative = _optional_float(order.get("cumQuantity")) or 0
-            average_price = _amount_value(order.get("avgPx"))
-            if cumulative <= 0 or average_price is None:
-                continue
-            shares = cumulative
-            notional = cumulative * average_price
-            fee = _amount_value(order.get("commissionNotionalTotalCollected")) or 0
-            break
     if shares <= 0:
         return None
-    total_cost = notional + fee
     return PaperFill(
         shares=shares,
         notional=notional,
         fee=fee,
-        total_cost=total_cost,
+        total_cost=notional + fee,
         average_price=notional / shares,
         fully_filled=shares >= requested_shares - 0.0001,
+    )
+
+
+def _last_execution_order(executions: list[Any]) -> dict[str, Any]:
+    for execution in reversed(executions):
+        if isinstance(execution, dict) and isinstance(execution.get("order"), dict):
+            return execution["order"]
+    return {}
+
+
+def _submission_unknown(
+    raw: Any,
+    fill: PaperFill | None,
+    state: str,
+    fallback_order_id: str = "",
+) -> LiveAttemptResult:
+    safe_raw = raw if isinstance(raw, dict) else {"response_type": type(raw).__name__}
+    return LiveAttemptResult(
+        order_id=str(safe_raw.get("id") or fallback_order_id),
+        state=state,
+        filled_shares=fill.shares if fill else 0,
+        average_price=fill.average_price if fill else None,
+        fee=fill.fee if fill else 0,
+        classification="submission_unknown",
+        raw=safe_raw,
     )
 
 
 def _amount_value(value: Any) -> float | None:
     if isinstance(value, dict):
         value = value.get("value")
-    if value in (None, ""):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    return _optional_float(value)
 
 
 def _optional_float(value: Any) -> float | None:
@@ -238,13 +390,12 @@ def _optional_float(value: Any) -> float | None:
 
 
 def _response_diagnostic(raw: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    """Return only order/execution fields that are safe to write to logs."""
     diagnostic: dict[str, Any] = {
         "order_id": "",
         "market": str(payload.get("marketSlug") or ""),
         "intent": str(payload.get("intent") or ""),
         "quantity": payload.get("quantity"),
-        "limit_price": _amount_value(payload.get("price")),
+        "raw_yes_limit": _amount_value(payload.get("price")),
         "executions": 0,
         "states": [],
         "execution_types": [],
@@ -254,7 +405,6 @@ def _response_diagnostic(raw: Any, payload: dict[str, Any]) -> dict[str, Any]:
     }
     if not isinstance(raw, dict):
         return diagnostic
-
     diagnostic["order_id"] = str(raw.get("id") or "")
     executions = raw.get("executions")
     if not isinstance(executions, list):
@@ -299,21 +449,9 @@ def _response_diagnostic(raw: Any, payload: dict[str, Any]) -> dict[str, Any]:
     return diagnostic
 
 
-def _zero_fill_classification(diagnostic: dict[str, Any]) -> str:
-    types = set(diagnostic.get("execution_types") or [])
-    states = set(diagnostic.get("states") or [])
-    if "EXECUTION_TYPE_REJECTED" in types or "ORDER_STATE_REJECTED" in states:
-        return "rejected"
-    if "EXECUTION_TYPE_CANCELED" in types or "ORDER_STATE_CANCELED" in states:
-        return "canceled_no_fill"
-    if "EXECUTION_TYPE_EXPIRED" in types or "ORDER_STATE_EXPIRED" in states:
-        return "expired_no_fill"
-    return "ioc_no_fill"
-
-
 def _format_diagnostic(diagnostic: dict[str, Any]) -> str:
     summary_keys = (
-        "order_id", "market", "intent", "quantity", "limit_price",
+        "order_id", "market", "intent", "quantity", "raw_yes_limit",
         "executions", "states", "execution_types", "trade_ids",
         "response_type", "executions_value_type",
     )
@@ -327,8 +465,6 @@ def _format_diagnostic(diagnostic: dict[str, Any]) -> str:
 
 
 def _safe_error_text(exc: Exception, *sensitive_values: str) -> str:
-    # SDK exceptions contain HTTP status/body details. Limit length and flatten
-    # whitespace, then redact common authentication fields and configured keys.
     text = " ".join(str(exc).split())
     text = re.sub(
         r"(?i)(authorization|x-pm-access-key|x-pm-signature|secret[_ -]?key|"

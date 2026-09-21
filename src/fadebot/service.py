@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
@@ -16,12 +17,16 @@ from .clients import (
 )
 from .config import Settings
 from .db import Database
-from .live import LiveOrderError, PolymarketLiveExecutor
+from .live import LiveAttemptResult, PolymarketLiveExecutor
 from .mapping import InternationalToUSMapper, MappingError
-from .models import FadeSignal, MarketInfo
-from .paper import simulate_market_buy, simulate_share_buy
+from .models import FadeSignal, MarketInfo, PaperFill
+from .paper import simulate_market_buy
 
 logger = logging.getLogger(__name__)
+
+LIVE_CHASE_MAX_SECONDS = 15.0
+LIVE_CHASE_MAX_ATTEMPTS = 10
+LIVE_CHASE_RETRY_DELAY_SECONDS = 0.25
 
 
 class TradingService:
@@ -48,6 +53,8 @@ class TradingService:
             else None
         )
         self._tasks: list[asyncio.Task[Any]] = []
+        self._monotonic = time.monotonic
+        self._sleep = asyncio.sleep
 
     async def start(self) -> None:
         self._tasks = [
@@ -239,19 +246,15 @@ class TradingService:
             if asks and min(price for price, _ in asks) > max_price:
                 await reject("price_guard_exceeded")
                 return
-            fill = simulate_share_buy(
-                asks,
-                self.settings.live_shares_per_trade,
-                fees_enabled=target_market.fees_enabled,
-                fee_rate=target_market.fee_rate,
-                min_order_size=float(book.get("min_order_size") or 0),
-                max_price=max_price,
-            )
         except Exception as exc:
             await reject(f"orderbook_failed:{type(exc).__name__}")
-            logger.warning("Could not simulate live fill for %s: %s", target_market.market_slug, exc)
+            logger.warning("Could not load live book for %s: %s", target_market.market_slug, exc)
             return
-        if fill is None:
+        available_shares = sum(
+            size for price, size in asks if price <= max_price + 1e-9
+        )
+        min_order_size = float(book.get("min_order_size") or 0)
+        if available_shares <= 0 or available_shares + 1e-9 < min_order_size:
             await reject("unfilled_no_liquidity")
             return
         if not await self.database.claim_live_market_side(
@@ -259,78 +262,205 @@ class TradingService:
         ):
             await reject("live_opposite_side_already_attempted")
             return
-        best_ask = min((price for price, _ in asks), default=None)
-        available_shares = sum(
-            size for price, size in asks if price <= max_price + 1e-9
-        )
         logger.info(
-            "LIVE ORDER ATTEMPT signal_id=%s source_market=%s us_market=%s "
-            "outcome=%s quantity=%s best_ask=%s limit_price=%.6f "
-            "available_shares_at_or_below_limit=%.4f",
+            "LIVE CHASE START signal_id=%s source_market=%s market=%s outcome=%s "
+            "target_shares=%s reference_price=%.6f max_price=%.6f",
             signal.signal_id,
             market.market_slug,
             target_market.market_slug,
             target_outcome,
             self.settings.live_shares_per_trade,
-            best_ask,
+            signal.paper_reference_price,
             max_price,
-            available_shares,
         )
-        try:
-            execution = await self.live_executor.buy(
-                token_id=token_id,
-                max_price=max_price,
-                requested_shares=self.settings.live_shares_per_trade,
-                tick_size=tick_size,
-                neg_risk=target_market.neg_risk,
-            )
-        except LiveOrderError as exc:
-            await reject(f"live_order_{exc.classification}")
-            logger.error(
-                "Live order ended without a recorded trade for %s: "
-                "classification=%s detail=%s; it was not retried",
-                target_market.market_slug,
-                exc.classification,
-                exc,
-            )
+        execution = await self._chase_live_order(
+            signal=signal,
+            target_market=target_market,
+            target_outcome=target_outcome,
+            token_id=token_id,
+            max_price=max_price,
+            first_book=book,
+        )
+        if execution is None:
             return
-        except Exception as exc:
-            await reject(f"live_order_failed:{type(exc).__name__}")
-            logger.exception("Live order failed for %s; it was not retried", target_market.market_slug)
-            return
-        log_message = (
-            "LIVE ORDER FILLED"
-            if execution.status == "filled"
-            else "LIVE ORDER PARTIALLY FILLED"
-        )
-        logger.info(
-            "%s order_id=%s market=%s outcome=%s requested_shares=%s "
-            "filled_shares=%.4f avg_price=%.6f fees=%.6f total_cost=%.6f status=%s",
-            log_message,
-            execution.order_id,
-            target_market.market_slug,
-            target_outcome,
-            self.settings.live_shares_per_trade,
-            execution.fill.shares,
-            execution.fill.average_price,
-            execution.fill.fee,
-            execution.fill.total_cost,
-            execution.status,
-        )
+        fill, order_ids, status, stop_reason = execution
         await self.database.create_trade(
-            signal, target_market, token_id, execution.fill, received_at,
+            signal, target_market, token_id, fill, received_at,
             execution_mode="live", max_price=max_price,
-            external_order_id=execution.order_id, external_status=execution.status,
+            external_order_id=",".join(order_ids), external_status=status,
             platform=target_market.platform, outcome=target_outcome,
         )
         await self.database.record_live_attempt(
-            signal.signal_id, "traded", execution.status
+            signal.signal_id, "traded", status if not stop_reason else f"{status}:{stop_reason}"
         )
         logger.info(
-            "Live trade %s %s: %.4f shares @ %.4f, cost $%.2f (ceiling %.3f)",
-            target_outcome, target_market.market_slug, execution.fill.shares,
-            execution.fill.average_price, execution.fill.total_cost, max_price,
+            "LIVE CHASE COMPLETE shares=%.4f average_economic_price=%.6f "
+            "fees=%.6f total_cost=%.6f status=%s",
+            fill.shares,
+            fill.average_price,
+            fill.fee,
+            fill.total_cost,
+            status,
         )
+
+    async def _chase_live_order(
+        self,
+        *,
+        signal: FadeSignal,
+        target_market: MarketInfo,
+        target_outcome: str,
+        token_id: str,
+        max_price: float,
+        first_book: dict[str, Any],
+    ) -> tuple[PaperFill, list[str], str, str | None] | None:
+        target_shares = self.settings.live_shares_per_trade
+        total_shares = 0.0
+        total_notional = 0.0
+        total_fee = 0.0
+        order_ids: list[str] = []
+        started = self._monotonic()
+        stop_reason: str | None = None
+        book = first_book
+
+        for attempt in range(1, LIVE_CHASE_MAX_ATTEMPTS + 1):
+            if self._monotonic() - started >= LIVE_CHASE_MAX_SECONDS:
+                stop_reason = "chase_timeout"
+                break
+            remaining = target_shares - total_shares
+            if remaining <= 0.0001:
+                break
+            if attempt > 1:
+                try:
+                    book = await self.polymarket_us.orderbook(token_id)
+                except Exception as exc:
+                    logger.warning(
+                        "LIVE CHASE book refresh failed market=%s error=%s",
+                        target_market.market_slug,
+                        exc,
+                    )
+                    stop_reason = "market_unavailable"
+                    break
+
+            try:
+                asks = [
+                    (float(level["price"]), float(level["size"]))
+                    for level in book.get("asks") or []
+                ]
+                tick_size = str(book.get("tick_size") or "0.01")
+                min_order_size = float(book.get("min_order_size") or 0)
+            except (TypeError, ValueError, KeyError):
+                stop_reason = "invalid_orderbook"
+                break
+            if not asks:
+                stop_reason = "no_liquidity"
+                break
+            best_ask = min(price for price, _ in asks)
+            price_reason = live_entry_price_reason(best_ask, self.settings)
+            if price_reason:
+                stop_reason = price_reason
+                break
+            if best_ask > max_price + 1e-9:
+                stop_reason = "price_above_original_ceiling"
+                break
+            available_shares = sum(
+                size for price, size in asks if price <= max_price + 1e-9
+            )
+            if available_shares <= 0 or available_shares + 1e-9 < min_order_size:
+                stop_reason = "no_liquidity"
+                break
+            requested = int(round(remaining))
+            if requested <= 0 or requested + 1e-9 < min_order_size:
+                stop_reason = "remaining_below_minimum"
+                break
+
+            try:
+                result: LiveAttemptResult = await self.live_executor.buy(
+                    token_id=token_id,
+                    max_price=max_price,
+                    requested_shares=requested,
+                    tick_size=tick_size,
+                    neg_risk=target_market.neg_risk,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Unexpected live executor failure for %s; no retry",
+                    target_market.market_slug,
+                )
+                result = LiveAttemptResult(
+                    "", "UNKNOWN", 0, None, 0, "submission_unknown",
+                    {"error_type": type(exc).__name__},
+                )
+
+            if result.order_id:
+                order_ids.append(result.order_id)
+            if result.filled_shares > 0 and result.average_price is not None:
+                total_shares += result.filled_shares
+                total_notional += result.notional
+                total_fee += result.fee
+            remaining = max(0.0, target_shares - total_shares)
+            logger.info(
+                "ATTEMPT %d best_ask=%.6f requested=%d order_id=%s state=%s "
+                "classification=%s filled=%.4f remaining=%.4f",
+                attempt,
+                best_ask,
+                requested,
+                result.order_id,
+                result.state,
+                result.classification,
+                result.filled_shares,
+                remaining,
+            )
+            if remaining <= 0.0001:
+                break
+            if result.classification == "rejected":
+                stop_reason = "rejected"
+                break
+            if result.classification == "submission_unknown":
+                stop_reason = "submission_unknown"
+                break
+            if result.classification not in {
+                "confirmed_zero_fill", "partial_fill", "filled"
+            }:
+                stop_reason = "submission_unknown"
+                break
+            if attempt == LIVE_CHASE_MAX_ATTEMPTS:
+                stop_reason = "attempt_limit"
+                break
+            if result.classification == "confirmed_zero_fill":
+                await self._sleep(LIVE_CHASE_RETRY_DELAY_SECONDS)
+
+        if total_shares <= 0:
+            reason = stop_reason or "attempt_limit"
+            await self.database.record_live_attempt(
+                signal.signal_id, "rejected", f"live_order_{reason}"
+            )
+            logger.info(
+                "LIVE CHASE STOPPED filled=0 remaining=%s reason=%s",
+                target_shares,
+                reason,
+            )
+            return None
+
+        status = (
+            "filled" if total_shares >= target_shares - 0.0001
+            else "partially_filled"
+        )
+        fill = PaperFill(
+            shares=total_shares,
+            notional=total_notional,
+            fee=total_fee,
+            total_cost=total_notional + total_fee,
+            average_price=total_notional / total_shares,
+            fully_filled=status == "filled",
+        )
+        if status == "partially_filled":
+            logger.info(
+                "LIVE CHASE STOPPED filled=%.4f remaining=%.4f reason=%s",
+                total_shares,
+                max(0.0, target_shares - total_shares),
+                stop_reason or "attempt_limit",
+            )
+        return fill, order_ids, status, stop_reason
 
     def eligibility_reason(
         self, signal: FadeSignal, market: MarketInfo, now: datetime
@@ -356,12 +486,31 @@ class TradingService:
         trades = await self.database.open_trades()
         for trade in trades:
             try:
-                market_client = (
-                    self.polymarket_us
-                    if trade.get("platform") == "us"
-                    else self.polymarket
-                )
-                market = await market_client.market_by_slug(trade["market_slug"])
+                if trade.get("platform") == "us":
+                    yes_settlement = await self.polymarket_us.official_settlement(
+                        trade["market_slug"]
+                    )
+                    if yes_settlement is None:
+                        continue
+                    final_price = _us_outcome_settlement(
+                        yes_settlement, trade["outcome"]
+                    )
+                    resolved_outcome = _resolved_us_label(yes_settlement)
+                    await self.database.settle_trade(
+                        int(trade["id"]),
+                        final_price=final_price,
+                        resolved_outcome=resolved_outcome,
+                        settled_at=datetime.now(timezone.utc),
+                    )
+                    logger.info(
+                        "Settled US trade %s from official settlement at %.2f (%s)",
+                        trade["id"],
+                        final_price,
+                        resolved_outcome,
+                    )
+                    continue
+
+                market = await self.polymarket.market_by_slug(trade["market_slug"])
                 if not market.closed:
                     continue
                 final_price = market.final_price_for(trade["outcome"])
@@ -383,6 +532,37 @@ class TradingService:
             except Exception:
                 logger.exception("Could not settle trade %s", trade["id"])
 
+    async def reconcile_live_settlements(self) -> dict[str, int]:
+        """Repair every US live trade using only official settlement data."""
+        counts = {"settled": 0, "reopened": 0, "errors": 0}
+        for trade in await self.database.live_us_trades():
+            try:
+                yes_settlement = await self.polymarket_us.official_settlement(
+                    trade["market_slug"]
+                )
+            except Exception:
+                logger.exception(
+                    "Official settlement lookup failed for trade %s; unchanged",
+                    trade["id"],
+                )
+                counts["errors"] += 1
+                continue
+            if yes_settlement is None:
+                await self.database.reopen_trade(int(trade["id"]))
+                counts["reopened"] += 1
+                continue
+            final_price = _us_outcome_settlement(
+                yes_settlement, trade["outcome"]
+            )
+            await self.database.reconcile_trade_settlement(
+                int(trade["id"]),
+                final_price=final_price,
+                resolved_outcome=_resolved_us_label(yes_settlement),
+                settled_at=datetime.now(timezone.utc),
+            )
+            counts["settled"] += 1
+        return counts
+
 
 def _resolved_label(market: MarketInfo) -> str:
     if not market.outcome_prices:
@@ -393,6 +573,27 @@ def _resolved_label(market: MarketInfo) -> str:
     if market.outcome_prices[winner_index] >= 0.99:
         return market.outcomes[winner_index]
     if all(abs(price - 0.5) <= 0.01 for price in market.outcome_prices):
+        return "void"
+    return "split"
+
+
+def _us_outcome_settlement(yes_settlement: float, outcome: str) -> float:
+    if not 0 <= yes_settlement <= 1:
+        raise ValueError("US settlement must be between zero and one")
+    selected = outcome.upper()
+    if selected == "YES":
+        return yes_settlement
+    if selected == "NO":
+        return 1.0 - yes_settlement
+    raise ValueError(f"Unknown US trade outcome: {outcome}")
+
+
+def _resolved_us_label(yes_settlement: float) -> str:
+    if yes_settlement >= 0.99:
+        return "YES"
+    if yes_settlement <= 0.01:
+        return "NO"
+    if abs(yes_settlement - 0.5) <= 0.01:
         return "void"
     return "split"
 
